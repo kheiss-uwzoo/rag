@@ -73,6 +73,7 @@ You can clone the RAG Blueprint GIt repository to create a local working copy yo
    ```  
 ## First Time Deployment
 
+
  The expected first-time deployment timeline consists of the following:
    
    - Initial deployment takes 10-15 minutes for the NIM LLM service while models are downloaded and cached
