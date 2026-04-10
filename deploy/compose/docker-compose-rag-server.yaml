@@ -31,10 +31,10 @@ services:
       ##===Vector DB specific configurations===
       # URL on which vectorstore is hosted
       # For custom operators, point to your service (e.g., http://your-custom-vdb:1234)
-      APP_VECTORSTORE_URL: ${APP_VECTORSTORE_URL:-http://milvus:19530}
+      APP_VECTORSTORE_URL: ${APP_VECTORSTORE_URL:-http://elasticsearch:9200}
       # Type of vectordb used to store embedding. Supported built-ins: "milvus", "elasticsearch".
       # You can also provide your custom value (e.g., "your_custom_vdb") when you register it in `_get_vdb_op`.
-      APP_VECTORSTORE_NAME: ${APP_VECTORSTORE_NAME:-"milvus"}
+      APP_VECTORSTORE_NAME: ${APP_VECTORSTORE_NAME:-"elasticsearch"}
       # Type of index to be used for vectorstore
       APP_VECTORSTORE_INDEXTYPE: ${APP_VECTORSTORE_INDEXTYPE:-"GPU_CAGRA"}
       
@@ -47,8 +47,8 @@ services:
       # Weight for sparse vector search in case of "weighted" Hybrid Search
       APP_VECTORSTORE_SPARSE_WEIGHT: ${APP_VECTORSTORE_SPARSE_WEIGHT:-0.5}
       
-      # Boolean to control GPU search for milvus vectorstore specific to rag-server
-      APP_VECTORSTORE_ENABLEGPUSEARCH: ${APP_VECTORSTORE_ENABLEGPUSEARCH:-True}
+      # Milvus only (ignored for Elasticsearch). Set True when using Milvus + GPU.
+      APP_VECTORSTORE_ENABLEGPUSEARCH: ${APP_VECTORSTORE_ENABLEGPUSEARCH:-False}
       # ef: Parameter controlling query time/accuracy trade-off. Higher ef leads to more accurate but slower search.
       APP_VECTORSTORE_EF: ${APP_VECTORSTORE_EF:-100} # Must be greater or equal to VECTOR_DB_TOPK
       # Username for vector store 
@@ -66,27 +66,33 @@ services:
       # Top K from vector DB, which goes as input to reranker model if enabled, else goes to LLM prompt
       VECTOR_DB_TOPK: ${VECTOR_DB_TOPK:-100}
 
+      # Fetch full page context: when True, fetches ALL chunks for retrieved pages and organizes by page
+      # Useful for PDFs where we have page numbers in file
+      APP_FETCH_FULL_PAGE_CONTEXT: ${APP_FETCH_FULL_PAGE_CONTEXT:-false}
+      # N pages before/after each retrieved page (0=disabled, 1=+/-1 page). Requires APP_FETCH_FULL_PAGE_CONTEXT=true
+      APP_FETCH_NEIGHBORING_PAGES: ${APP_FETCH_NEIGHBORING_PAGES:-0}
+
       ##===LLM Model specific configurations===
-      APP_LLM_MODELNAME: ${APP_LLM_MODELNAME:-"nvidia/llama-3.3-nemotron-super-49b-v1.5"}
+      APP_LLM_MODELNAME: ${APP_LLM_MODELNAME:-"nvidia/nemotron-3-super-120b-a12b"}
       # url on which llm model is hosted. If "", Nvidia hosted API is used
       APP_LLM_SERVERURL: ${APP_LLM_SERVERURL-"nim-llm:8000"}
       # LLM model parameters
-      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-32768}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-131072}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0}
       LLM_TOP_P: ${LLM_TOP_P:-1.0}
 
-      # Reasoning configuration (supported by Nemotron 3 and other reasoning models)
-      LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-false}
-      LLM_REASONING_BUDGET: ${LLM_REASONING_BUDGET:-0}
-      LLM_LOW_EFFORT: ${LLM_LOW_EFFORT:-false}
+      # Reasoning configuration (enabled by default for Nemotron 3 Super)
+      LLM_ENABLE_THINKING: ${LLM_ENABLE_THINKING:-true}
+      LLM_REASONING_BUDGET: ${LLM_REASONING_BUDGET:-256}
+      LLM_LOW_EFFORT: ${LLM_LOW_EFFORT:-true}
 
       ##===Query Rewriter Model specific configurations===
-      APP_QUERYREWRITER_MODELNAME: ${APP_QUERYREWRITER_MODELNAME:-"nvidia/llama-3.3-nemotron-super-49b-v1.5"}
+      APP_QUERYREWRITER_MODELNAME: ${APP_QUERYREWRITER_MODELNAME:-"nvidia/nemotron-3-super-120b-a12b"}
       # url on which query rewriter model is hosted. If "", Nvidia hosted API is used
       APP_QUERYREWRITER_SERVERURL: ${APP_QUERYREWRITER_SERVERURL-"nim-llm:8000"}
 
       ##===Filter Expression Generator Model specific configurations===
-      APP_FILTEREXPRESSIONGENERATOR_MODELNAME: ${APP_FILTEREXPRESSIONGENERATOR_MODELNAME:-"nvidia/llama-3.3-nemotron-super-49b-v1.5"}
+      APP_FILTEREXPRESSIONGENERATOR_MODELNAME: ${APP_FILTEREXPRESSIONGENERATOR_MODELNAME:-"nvidia/nemotron-3-super-120b-a12b"}
       # url on which filter expression generator model is hosted. If "", Nvidia hosted API is used
       APP_FILTEREXPRESSIONGENERATOR_SERVERURL: ${APP_FILTEREXPRESSIONGENERATOR_SERVERURL-"nim-llm:8000"}
       # enable filter expression generator for natural language to filter expression conversion
@@ -189,7 +195,7 @@ services:
       # Minimum groundedness score threshold (0-2)
       RESPONSE_GROUNDEDNESS_THRESHOLD: ${RESPONSE_GROUNDEDNESS_THRESHOLD:-1}
       # reflection llm
-      REFLECTION_LLM: ${REFLECTION_LLM:-"nvidia/llama-3.3-nemotron-super-49b-v1.5"}
+      REFLECTION_LLM: ${REFLECTION_LLM:-"nvidia/nemotron-3-super-120b-a12b"}
       # reflection llm server url. If "", Nvidia hosted API is used
       REFLECTION_LLM_SERVERURL: ${REFLECTION_LLM_SERVERURL-"nim-llm:8000"}
       # enable iterative query decomposition
@@ -220,7 +226,6 @@ services:
         # Environment variables for Vite build
         VITE_API_CHAT_URL: ${VITE_API_CHAT_URL:-http://rag-server:8081/v1}
         VITE_API_VDB_URL: ${VITE_API_VDB_URL:-http://ingestor-server:8082/v1}
-        VITE_MILVUS_URL: http://milvus:19530
         DOWNLOAD_LEGAL_COMPLIANCE: ${DOWNLOAD_LEGAL_COMPLIANCE:-false}
     ports:
       - "8090:3000"
@@ -230,7 +235,6 @@ services:
       # Runtime environment variables for Vite
       VITE_API_CHAT_URL: ${VITE_API_CHAT_URL:-http://rag-server:8081/v1}
       VITE_API_VDB_URL: ${VITE_API_VDB_URL:-http://ingestor-server:8082/v1}
-      VITE_MILVUS_URL: http://milvus:19530
     depends_on:
       - rag-server
 

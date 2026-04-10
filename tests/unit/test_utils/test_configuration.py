@@ -52,8 +52,8 @@ class TestVectorStoreConfig:
         """Test default configuration values."""
         config = VectorStoreConfig()
 
-        assert config.name == "milvus"
-        assert config.url == "http://localhost:19530"
+        assert config.name == "elasticsearch"
+        assert config.url == "http://localhost:9200"
         assert config.nlist == 64
         assert config.nprobe == 16
         assert config.index_type == "GPU_CAGRA"
@@ -122,7 +122,7 @@ class TestLLMConfig:
         config = LLMConfig()
 
         assert config.server_url == ""
-        assert config.model_name == "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+        assert config.model_name == "nvidia/nemotron-3-super-120b-a12b"
         assert config.model_engine == "nvidia-ai-endpoints"
         assert isinstance(config.parameters, ModelParametersConfig)
         assert config.parameters.max_tokens == 32768
@@ -175,7 +175,7 @@ class TestQueryRewriterConfig:
         """Test default configuration values."""
         config = QueryRewriterConfig()
 
-        assert config.model_name == "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+        assert config.model_name == "nvidia/nemotron-3-super-120b-a12b"
         assert config.server_url == ""
         assert config.enable_query_rewriter is False
 
@@ -231,6 +231,8 @@ class TestRetrieverConfig:
         assert config.score_threshold == 0.25
         assert config.nr_url == "http://retrieval-ms:8000"
         assert config.nr_pipeline == "ranked_hybrid"
+        assert config.fetch_full_page_context is False
+        assert config.fetch_neighboring_pages == 0
 
 
 class TestMinioConfig:
@@ -253,7 +255,7 @@ class TestSummarizerConfig:
         """Test default configuration values."""
         config = SummarizerConfig()
 
-        assert config.model_name == "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+        assert config.model_name == "nvidia/nemotron-3-super-120b-a12b"
         assert config.server_url == ""
         assert config.max_chunk_length == 9000
         assert config.chunk_overlap == 400
@@ -529,7 +531,7 @@ class TestConfigurationIntegration:
         env_vars = {
             "APP_VECTORSTORE_NAME": '"milvus"',  # Docker Compose style with quotes
             "APP_VECTORSTORE_URL": '"http://milvus:19530"',
-            "APP_LLM_MODELNAME": '"nvidia/llama-3.3-nemotron-super-49b-v1.5"',
+            "APP_LLM_MODELNAME": '"nvidia/nemotron-3-super-120b-a12b"',
             "COLLECTION_NAME": '"test_collection"',
         }
 
@@ -539,7 +541,7 @@ class TestConfigurationIntegration:
             # Verify that quoted strings are correctly stripped
             assert config.vector_store.name == "milvus"
             assert config.vector_store.url == "http://milvus:19530"
-            assert config.llm.model_name == "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+            assert config.llm.model_name == "nvidia/nemotron-3-super-120b-a12b"
             assert config.vector_store.default_collection_name == "test_collection"
 
     @patch.dict(os.environ, {}, clear=True)
@@ -845,6 +847,35 @@ class TestRetrieverConfigValidation:
             in str(exc_info.value)
         )
 
+    def test_fetch_neighboring_pages_requires_fetch_full_page_context(self):
+        """Test that fetch_neighboring_pages > 0 requires fetch_full_page_context."""
+        with pytest.raises(ValidationError) as exc_info:
+            RetrieverConfig(
+                fetch_full_page_context=False,
+                fetch_neighboring_pages=1,
+            )
+
+        assert "fetch_full_page_context must be True" in str(exc_info.value)
+
+    def test_fetch_neighboring_pages_negative_raises_error(self):
+        """Test that negative fetch_neighboring_pages raises ValueError."""
+        with pytest.raises(ValidationError) as exc_info:
+            RetrieverConfig(fetch_neighboring_pages=-1)
+
+        assert "fetch_neighboring_pages must be >= 0" in str(exc_info.value)
+
+    def test_fetch_neighboring_pages_exceeds_max_raises_error(self):
+        """Test that fetch_neighboring_pages > 10 raises ValueError."""
+        with pytest.raises(ValidationError) as exc_info:
+            RetrieverConfig(fetch_neighboring_pages=11)
+
+        assert "fetch_neighboring_pages must be <= 10" in str(exc_info.value)
+
+    def test_fetch_neighboring_pages_max_boundary_accepted(self):
+        """Test that fetch_neighboring_pages == 10 is valid."""
+        config = RetrieverConfig(fetch_full_page_context=True, fetch_neighboring_pages=10)
+        assert config.fetch_neighboring_pages == 10
+
 
 class TestTracingConfigNormalize:
     """Test cases for TracingConfig normalize_url method."""
@@ -889,13 +920,13 @@ class TestNvidiaRAGConfigFileLoading:
         """Test that from_yaml returns default config when file doesn't exist."""
         config = NvidiaRAGConfig.from_yaml("/nonexistent/path/config.yaml")
         assert isinstance(config, NvidiaRAGConfig)
-        assert config.vector_store.name == "milvus"
+        assert config.vector_store.name == "elasticsearch"
 
     def test_from_json_file_not_exists(self):
         """Test that from_json returns default config when file doesn't exist."""
         config = NvidiaRAGConfig.from_json("/nonexistent/path/config.json")
         assert isinstance(config, NvidiaRAGConfig)
-        assert config.vector_store.name == "milvus"
+        assert config.vector_store.name == "elasticsearch"
 
     def test_from_yaml_file_exists(self):
         """Test that from_yaml loads config from existing file."""

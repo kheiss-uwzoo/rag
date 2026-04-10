@@ -99,7 +99,7 @@ This modular design ensures efficient query processing, accurate retrieval of in
 
 - Response Generation (Inference)
 
-    - [NVIDIA NIM llama-3.3-nemotron-super-49b-v1.5](https://build.nvidia.com/nvidia/llama-3_3-nemotron-super-49b-v1_5)
+    - [NVIDIA NIM nemotron-3-super-120b-a12b](https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b)
 
 - Retriever and Extraction Models
 
@@ -108,7 +108,7 @@ This modular design ensures efficient query processing, accurate retrieval of in
     - [NeMo Retriever Page Elements NIM](https://build.nvidia.com/nvidia/nemotron-page-elements-v3)
     - [NeMo Retriever Table Structure NIM](https://build.nvidia.com/nvidia/nemotron-table-structure-v1)
     - [NeMo Retriever Graphic Elements NIM](https://build.nvidia.com/nvidia/nemotron-graphic-elements-v1)
-    - [NeMo Retriever OCR NIM](https://build.nvidia.com/nvidia/nemoretriever-ocr)
+    - [Nemotron OCR NIM](https://build.nvidia.com/nvidia/nemotron-ocr)
 
 - Optional NIMs
 
@@ -124,7 +124,7 @@ This modular design ensures efficient query processing, accurate retrieval of in
 
 - **RAG Orchestrator Server** – Coordinates interactions between the user, retrievers, vector database, and inference models, ensuring multi-turn and context-aware query handling. This is [LangChain](https://www.langchain.com/)-based.
 
-- **Vector Database (accelerated with NVIDIA cuVS)** – Stores and searches embeddings at scale with GPU-accelerated indexing and retrieval for low-latency performance. You can use [Milvus Vector Database](https://milvus.io/) or [Elasticsearch](https://www.elastic.co/elasticsearch/vector-database).
+- **Vector Database (accelerated with NVIDIA cuVS)** – Stores and searches embeddings at scale with GPU-accelerated indexing and retrieval for low-latency performance. The default is [Elasticsearch](https://www.elastic.co/elasticsearch/vector-database). Another alternative is [Milvus](https://milvus.io/) (GPU-accelerated).
 
 - **NeMo Retriever Extraction** – A high-performance ingestion microservice for parsing multimodal content. For more information about the ingestion pipeline, see [NeMo Retriever Extraction Overview](https://docs.nvidia.com/nemo/retriever/latest/extraction/overview/)
 
@@ -229,5 +229,5 @@ The following models that are built with Llama are governed by the Llama 3.2 Com
 
 ## Additional Information
 
-The [Llama 3.1 Community License Agreement](https://www.llama.com/llama3_1/license/) for the llama-3.1-nemotron-nano-vl-8b-v1, llama-3.1-nemoguard-8b-content-safety and llama-3.1-nemoguard-8b-topic-control models. The [Llama 3.2 Community License Agreement](https://www.llama.com/llama3_2/license/) for the nvidia/llama-nemotron-embed-1b-v2, nvidia/llama-nemotron-rerank-1b-v2 and llama-3.2-nemoretriever-1b-vlm-embed-v1 models. The [Llama 3.3 Community License Agreement](https://github.com/meta-llama/llama-models/blob/main/models/llama3_3/LICENSE) for the llama-3.3-nemotron-super-49b-v1.5 models. Built with Llama. Apache 2.0 for NVIDIA Ingest and for the nemoretriever-page-elements-v2, nemotron-table-structure-v1, nemotron-graphic-elements-v1, paddleocr and nemoretriever-ocr-v1 models.
+The [Llama 3.1 Community License Agreement](https://www.llama.com/llama3_1/license/) for the llama-3.1-nemotron-nano-vl-8b-v1, llama-3.1-nemoguard-8b-content-safety and llama-3.1-nemoguard-8b-topic-control models. The [Llama 3.2 Community License Agreement](https://www.llama.com/llama3_2/license/) for the nvidia/llama-nemotron-embed-1b-v2, nvidia/llama-nemotron-rerank-1b-v2 and llama-3.2-nemoretriever-1b-vlm-embed-v1 models. The [Llama 3.3 Community License Agreement](https://github.com/meta-llama/llama-models/blob/main/models/llama3_3/LICENSE) for the llama-3.3-nemotron-super-49b-v1.5 models. Built with Llama. Apache 2.0 for NVIDIA Ingest and for the nemoretriever-page-elements-v2, nemotron-table-structure-v1, nemotron-graphic-elements-v1, paddleocr and nemotron-ocr-v1 models.
 

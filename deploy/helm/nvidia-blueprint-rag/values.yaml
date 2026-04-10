@@ -120,10 +120,10 @@ envVars:
 
   ##===Vector DB specific configurations===
   # URL on which vectorstore is hosted
-  APP_VECTORSTORE_URL: "http://milvus:19530" # Use "http://rag-eck-elasticsearch-es-http:9200" for elasticsearch
+  APP_VECTORSTORE_URL: "http://rag-eck-elasticsearch-es-http:9200" # Use "http://milvus:19530" for Milvus
   # Type of vectordb used to store embedding supported type "milvus" or "elasticsearch"
-  APP_VECTORSTORE_NAME: "milvus"
-  # Index type (e.g., GPU_CAGRA)
+  APP_VECTORSTORE_NAME: "elasticsearch"
+  # Index type (e.g., GPU_CAGRA); Milvus-oriented — Elasticsearch uses its own index mapping
   APP_VECTORSTORE_INDEXTYPE: "GPU_CAGRA"
   # Type of vectordb search to be used
   APP_VECTORSTORE_SEARCHTYPE: "dense"
@@ -133,8 +133,8 @@ envVars:
   APP_VECTORSTORE_DENSE_WEIGHT: "0.5"
   # Weight for sparse vector search in case of "weighted" Hybrid Search
   APP_VECTORSTORE_SPARSE_WEIGHT: "0.5"
-  # Boolean to control GPU search for milvus vectorstore specific to rag-server
-  APP_VECTORSTORE_ENABLEGPUSEARCH: "True"
+  # Milvus only (ignored for Elasticsearch). Set "True" when using Milvus + GPU.
+  APP_VECTORSTORE_ENABLEGPUSEARCH: "False"
   # ef: Parameter controlling query time/accuracy trade-off. Higher ef leads to more accurate but slower search.
   APP_VECTORSTORE_EF: "100"
   # Username for vector store authentication
@@ -155,23 +155,29 @@ envVars:
   # Number of document chunks to insert in LLM prompt
   APP_RETRIEVER_TOPK: "10"
 
+  # Fetch full page context: when True, fetches ALL chunks for retrieved pages and organizes by page
+  # Useful for PDFs where we have page numbers in file
+  APP_FETCH_FULL_PAGE_CONTEXT: "false"
+  # N pages before/after each retrieved page (0=disabled, 1=+/-1 page). Requires APP_FETCH_FULL_PAGE_CONTEXT=true
+  APP_FETCH_NEIGHBORING_PAGES: "0"
+
   ##===LLM Model specific configurations===
-  APP_LLM_MODELNAME: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+  APP_LLM_MODELNAME: "nvidia/nemotron-3-super-120b-a12b"
   # URL on which LLM model is hosted. If "", Nvidia hosted API is used
   APP_LLM_SERVERURL: "nim-llm:8000"
   # LLM model parameters
   # For Nemotron 3 Super on RTX 6000 Pro: uncomment and set to 16256 (reasoning) or 1024 (non-reasoning); comment LLM_MAX_TOKENS above
-  LLM_MAX_TOKENS: "32768" # "16256"
+  LLM_MAX_TOKENS: "131072" # "16256" for RTX 6000 Pro
   LLM_TEMPERATURE: "0"
   LLM_TOP_P: "1.0"
 
   ##===Query Rewriter Model specific configurations===
-  APP_QUERYREWRITER_MODELNAME: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+  APP_QUERYREWRITER_MODELNAME: "nvidia/nemotron-3-super-120b-a12b"
   # URL on which query rewriter model is hosted. If "", Nvidia hosted API is used
   APP_QUERYREWRITER_SERVERURL: "nim-llm:8000"
 
   ##===Filter Expression Generator Model specific configurations===
-  APP_FILTEREXPRESSIONGENERATOR_MODELNAME: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+  APP_FILTEREXPRESSIONGENERATOR_MODELNAME: "nvidia/nemotron-3-super-120b-a12b"
   # URL on which filter expression generator model is hosted. If "", Nvidia hosted API is used
   APP_FILTEREXPRESSIONGENERATOR_SERVERURL: "nim-llm:8000"
   # enable filter expression generator for natural language to filter expression conversion
@@ -246,7 +252,7 @@ envVars:
   # Minimum groundedness score threshold (0-2)
   RESPONSE_GROUNDEDNESS_THRESHOLD: "1"
   # reflection llm
-  REFLECTION_LLM: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+  REFLECTION_LLM: "nvidia/nemotron-3-super-120b-a12b"
   # reflection llm server url. If "", Nvidia hosted API is used
   REFLECTION_LLM_SERVERURL: "nim-llm:8000"
 
@@ -256,10 +262,10 @@ envVars:
   # Whether to filter content within <think></think> tags in model responses
   FILTER_THINK_TOKENS: "true"
 
-  # Reasoning configuration (supported by Nemotron 3 and other reasoning models)
-  LLM_ENABLE_THINKING: "false"
-  LLM_REASONING_BUDGET: "0"
-  LLM_LOW_EFFORT: "false"
+  # Reasoning configuration (enabled by default for Nemotron 3 Super)
+  LLM_ENABLE_THINKING: "true"
+  LLM_REASONING_BUDGET: "256"
+  LLM_LOW_EFFORT: "true"
 
   NEMO_GUARDRAILS_URL: "nemo-guardrails:7331"
 
@@ -318,8 +324,8 @@ ingestor-server:
     # Absolute path to custom prompt.yaml file
     PROMPT_CONFIG_FILE: "/prompt.yaml"
     # === Vector Store Configurations ===
-    APP_VECTORSTORE_URL: "http://milvus:19530" # Use "http://rag-eck-elasticsearch-es-http:9200" for elasticsearch
-    APP_VECTORSTORE_NAME: "milvus" # supported values: "milvus" or "elasticsearch"
+    APP_VECTORSTORE_URL: "http://rag-eck-elasticsearch-es-http:9200" # Use "http://milvus:19530" for Milvus
+    APP_VECTORSTORE_NAME: "elasticsearch" # supported values: "milvus" or "elasticsearch"
     APP_VECTORSTORE_SEARCHTYPE: "dense"
     # Type of ranker to use for vector store in case of Hybrid Search
     APP_VECTORSTORE_RANKER_TYPE: "rrf" # Can be "rrf" or "weighted"
@@ -327,8 +333,9 @@ ingestor-server:
     APP_VECTORSTORE_DENSE_WEIGHT: "0.5"
     # Weight for sparse vector search in case of "weighted" Hybrid Search
     APP_VECTORSTORE_SPARSE_WEIGHT: "0.5"
-    APP_VECTORSTORE_ENABLEGPUINDEX: "True"
-    APP_VECTORSTORE_ENABLEGPUSEARCH: "True"
+    # Milvus only (ignored for Elasticsearch). Set "True" when using Milvus + GPU.
+    APP_VECTORSTORE_ENABLEGPUINDEX: "False"
+    APP_VECTORSTORE_ENABLEGPUSEARCH: "False"
     # Username  for vector store authentication
     APP_VECTORSTORE_USERNAME: ""
     # Password for vector store authentication
@@ -385,7 +392,7 @@ ingestor-server:
 
     # === General ===
     # Summary Model Configurations
-    SUMMARY_LLM: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+    SUMMARY_LLM: "nvidia/nemotron-3-super-120b-a12b"
     SUMMARY_LLM_SERVERURL: "nim-llm:8000"
     SUMMARY_LLM_MAX_CHUNK_LENGTH: "9000"
     SUMMARY_CHUNK_OVERLAP: "400"
@@ -409,8 +416,6 @@ ingestor-server:
     REDIS_DB: "0"
     ENABLE_REDIS_BACKEND: "False"
 
-    # === Bulk upload to MinIO ===
-    ENABLE_MINIO_BULK_UPLOAD: "True"
     TEMP_DIR: "/tmp-data"
     INGESTOR_SERVER_DATA_DIR: "/data/"
 
@@ -418,6 +423,8 @@ ingestor-server:
     NV_INGEST_FILES_PER_BATCH: "16"
     NV_INGEST_CONCURRENT_BATCHES: "4"
     ENABLE_NV_INGEST_DYNAMIC_BATCHING: "True"
+    # Max memory budget (MB) for a single ingestion job; used for dynamic batch sizing
+    INGESTION_MAX_MEMORY_BUDGET_MB: "1024"
 
     # === Tracing ===
     APP_TRACING_ENABLED: "False"
@@ -479,12 +486,10 @@ frontend:
       value: "http://rag-server:8081/v1"
     - name: VITE_API_VDB_URL
       value: "http://ingestor-server:8082/v1"
-    - name: VITE_MILVUS_URL
-      value: "http://milvus:19530"
 
-# -- Elasticsearch dependency toggle
+# -- Elasticsearch dependency toggle (ECK). When true, align APP_VECTORSTORE_URL with the ES HTTP service (e.g. rag-eck-elasticsearch-es-http:9200).
 eck-elasticsearch:
-  enabled: false
+  enabled: true
   http:
     tls:
       selfSignedCertificate:
@@ -656,39 +661,35 @@ nimOperator:
     service:
       name: "nim-llm"
     image:
-      repository: nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5
+      repository: nvcr.io/nim/nvidia/nemotron-3-super-120b-a12b
       pullPolicy: IfNotPresent
-      tag: "1.14.0"
-# -- For Nemotron 3 Super: uncomment the block below and comment the image block above
+      tag: "1.8.0"
+# -- To switch back to Llama 3.3 Nemotron Super 49B (single GPU), replace the image block above with:
 #    image:
-#      repository: nvcr.io/nim/nvidia/nemotron-3-super-120b-a12b
+#      repository: nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5
 #      pullPolicy: IfNotPresent
-#      tag: "1.8.0"
+#      tag: "1.14.0"
+# -- and revert resources to 1 GPU and model engine to tensorrt_llm below.
     resources:
       limits:
-        nvidia.com/gpu: 1
+        nvidia.com/gpu: 2
       requests:
-        nvidia.com/gpu: 1
-# -- For Nemotron 3 Super (all hardware): uncomment the block below and comment the resources block above
+        nvidia.com/gpu: 2
+# -- To switch back to Llama 3.3 Nemotron Super 49B (single GPU), replace resources above with:
 #    resources:
 #      limits:
-#        nvidia.com/gpu: 2
+#        nvidia.com/gpu: 1
 #      requests:
-#        nvidia.com/gpu: 2
+#        nvidia.com/gpu: 1
     nodeSelector: {}
     tolerations: []
     model:
-      engine: tensorrt_llm
-# -- Uncomment this section to enable FP8 precision and throughput profile for the NIM LLM, change the GPU product according to the GPU you are using
-#      precision: "fp8"
-#      qosProfile: "throughput"
-#      tensorParallelism: "1"
-#      gpus:
-#        - product: "rtx6000_blackwell_sv"
-# -- For Nemotron 3 Super (all hardware): comment "engine: tensorrt_llm" above and uncomment the three lines below
-#      engine: vllm
-#      precision: "fp8"
-#      tensorParallelism: "2"
+      engine: vllm
+      precision: "fp8"
+      tensorParallelism: "2"
+# -- To switch back to Llama 3.3 Nemotron Super 49B, replace the model block above with:
+#    model:
+#      engine: tensorrt_llm
     storage:
       pvc:
         create: true
@@ -718,10 +719,14 @@ nimOperator:
       - name: NIM_TRITON_LOG_VERBOSE
         value: "1"
       - name: NIM_SERVED_MODEL_NAME
-        value: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
-      - name: NIM_MAX_MODEL_LEN
-        value: "131072"
-# -- For Nemotron 3 Super on RTX 6000 Pro: comment the NIM_MAX_MODEL_LEN entry above and uncomment the block below
+        value: "nvidia/nemotron-3-super-120b-a12b"
+      - name: NIM_ENABLE_CHUNKED_PREFILL
+        value: "1"
+      - name: NIM_KV_CACHE_DTYPE
+        value: "fp8"
+      - name: VLLM_ALLOW_LONG_MAX_MODEL_LEN
+        value: "1"
+# -- For Nemotron 3 Super on RTX 6000 Pro: comment the entries above and uncomment the block below
 #      - name: NIM_MAX_MODEL_LEN
 #        value: "32768"
 #      - name: NCCL_P2P_DISABLE
@@ -730,6 +735,9 @@ nimOperator:
 #        value: "0.9"
 #      - name: CUDA_VISIBLE_DEVICES
 #        value: "0"
+# -- To switch back to Llama 3.3 Nemotron Super 49B, replace NIM_SERVED_MODEL_NAME value above with:
+#        value: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+# -- and remove NIM_ENABLE_CHUNKED_PREFILL/NIM_KV_CACHE_DTYPE/VLLM_ALLOW_LONG_MAX_MODEL_LEN entries.
     expose:
       service:
         name: http
@@ -869,7 +877,7 @@ nimOperator:
       name: "nim-vlm"
     image:
       repository: nvcr.io/nim/nvidia/nemotron-nano-12b-v2-vl
-      tag: "1.5.0"
+      tag: "1.6.0"
       pullPolicy: IfNotPresent
     resources:
       limits:
@@ -907,7 +915,7 @@ nv-ingest:
     create: false
   image:
     repository: "nvcr.io/nvidia/nemo-microservices/nv-ingest"
-    tag: "26.1.2"
+    tag: "26.3.0"
   resources:
     limits:
       nvidia.com/gpu: 0
@@ -932,6 +940,7 @@ nv-ingest:
     RAY_num_grpc_threads: "1"
     RAY_num_server_call_thread: "1"
     RAY_worker_num_grpc_internal_threads: "1"
+    REDIS_POOL_SIZE: "50"
     
     EMBEDDING_NIM_ENDPOINT: "http://nemotron-embedding-ms:8000/v1"
     EMBEDDING_NIM_MODEL_NAME: "nvidia/llama-nemotron-embed-1b-v2"
@@ -943,17 +952,16 @@ nv-ingest:
     MINIO_BUCKET: "nv-ingest"
     MINIO_ACCESS_KEY: "minioadmin"
     MINIO_SECRET_KEY: "minioadmin"
-    MILVUS_ENDPOINT: "http://milvus:19530"
     OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
     MODEL_PREDOWNLOAD_PATH: "/workspace/models/"
     INSTALL_AUDIO_EXTRACTION_DEPS: "true"
     COMPONENTS_TO_READY_CHECK: "ALL"
 
-    # OCR routing (defaults to NeMo Retriever OCR service)
-    OCR_GRPC_ENDPOINT: nemoretriever-ocr-v1:8001
-    OCR_HTTP_ENDPOINT: http://nemoretriever-ocr-v1:8000/v1/infer
+    # OCR routing (nemotron-ocr-v1 service; use OCR_MODEL_NAME "pipeline" for Nemotron OCR)
+    OCR_GRPC_ENDPOINT: nemotron-ocr-v1:8001
+    OCR_HTTP_ENDPOINT: http://nemotron-ocr-v1:8000/v1/infer
     OCR_INFER_PROTOCOL: grpc
-    OCR_MODEL_NAME: scene_text_ensemble
+    OCR_MODEL_NAME: pipeline
 
     # NeMo Retriever Parse (VLM text extraction)
     NEMOTRON_PARSE_HTTP_ENDPOINT: http://nemotron-parse:8000/v1/chat/completions
@@ -965,14 +973,14 @@ nv-ingest:
 
     # YOLOX endpoints
     YOLOX_PAGE_IMAGE_FORMAT: "JPEG"
-    YOLOX_GRPC_ENDPOINT: nemoretriever-page-elements-v3:8001
-    YOLOX_HTTP_ENDPOINT: http://nemoretriever-page-elements-v3:8000/v1/infer
+    YOLOX_GRPC_ENDPOINT: nemotron-page-elements-v3:8001
+    YOLOX_HTTP_ENDPOINT: http://nemotron-page-elements-v3:8000/v1/infer
     YOLOX_INFER_PROTOCOL: grpc
-    YOLOX_GRAPHIC_ELEMENTS_GRPC_ENDPOINT: nemoretriever-graphic-elements-v1:8001
-    YOLOX_GRAPHIC_ELEMENTS_HTTP_ENDPOINT: http://nemoretriever-graphic-elements-v1:8000/v1/infer
+    YOLOX_GRAPHIC_ELEMENTS_GRPC_ENDPOINT: nemotron-graphic-elements-v1:8001
+    YOLOX_GRAPHIC_ELEMENTS_HTTP_ENDPOINT: http://nemotron-graphic-elements-v1:8000/v1/infer
     YOLOX_GRAPHIC_ELEMENTS_INFER_PROTOCOL: grpc
-    YOLOX_TABLE_STRUCTURE_GRPC_ENDPOINT: nemoretriever-table-structure-v1:8001
-    YOLOX_TABLE_STRUCTURE_HTTP_ENDPOINT: http://nemoretriever-table-structure-v1:8000/v1/infer
+    YOLOX_TABLE_STRUCTURE_GRPC_ENDPOINT: nemotron-table-structure-v1:8001
+    YOLOX_TABLE_STRUCTURE_HTTP_ENDPOINT: http://nemotron-table-structure-v1:8000/v1/infer
     YOLOX_TABLE_STRUCTURE_INFER_PROTOCOL: grpc
 
     # Captioning
@@ -983,8 +991,8 @@ nv-ingest:
     AUDIO_GRPC_ENDPOINT: nv-ingest-riva-nim:50051
     AUDIO_INFER_PROTOCOL: grpc
 
-  # Expose internal Milvus/MinIO config managed by nv-ingest subchart
-  milvusDeployed: true
+  # When false, nv-ingest does not deploy its Milvus subchart; RAG uses Elasticsearch (eck-elasticsearch + APP_VECTORSTORE_*).
+  milvusDeployed: false
   milvus:
     # Uncomment this section to enable authentication for Milvus
     # extraConfigFiles:
@@ -1034,27 +1042,21 @@ nv-ingest:
     embedqa:
       enabled: false
 
-    # NeMo Retriever OCR (default)
-    # To use PaddleOCR instead, override the image:
-    # nemoretriever_ocr_v1:
-    #   enabled: true
-    #   image:
-    #     repository: nvcr.io/nim/baidu/paddleocr
-    #     tag: 1.5.0
-    # And set OCR_MODEL_NAME to "paddle" in envVars above
-    nemoretriever_ocr_v1:
+    # OCR NIM (26.3.0: key renamed from nemoretriever_ocr_v1 to ocr; image nemotron-ocr-v1)
+    # To use PaddleOCR instead, override the image and set OCR_MODEL_NAME to "paddle" in envVars
+    ocr:
       enabled: true
       storage:
         pvc:
           volumeAccessMode: "ReadWriteOnce"
           storageClass: ""
       tolerations: []
-      replicaCount: 1
+      replicas: 1
       image:
-        repository: nvcr.io/nim/nvidia/nemoretriever-ocr-v1
-        tag: "1.2.1"
-      imagePullSecrets:
-        - name: ngc-secret
+        repository: nvcr.io/nim/nvidia/nemotron-ocr-v1
+        tag: "1.3.0"
+        pullSecrets:
+          - ngc-secret
       env:
         - name: OMP_NUM_THREADS
           value: "8"
@@ -1062,14 +1064,8 @@ nv-ingest:
           value: "8000"
         - name: NIM_TRITON_LOG_VERBOSE
           value: "1"
-        - name: CUDA_VISIBLE_DEVICES
-          value: "0"
-        - name: NIM_TRITON_CUDA_MEMORY_POOL_MB
-          value: "8192"
         - name: NIM_TRITON_MAX_BATCH_SIZE
           value: "32"
-        - name: NIM_TRITON_ENABLE_MODEL_CONTROL
-          value: "1"
       resources:
         limits:
           nvidia.com/gpu: 1
@@ -1084,7 +1080,7 @@ nv-ingest:
           volumeAccessMode: "ReadWriteOnce"
           storageClass: ""
       tolerations: []
-      replicaCount: 1
+      replicas: 1
       image:
         repository: nvcr.io/nim/nvidia/nemotron-graphic-elements-v1
         tag: "1.8.0"
@@ -1095,8 +1091,6 @@ nv-ingest:
           value: "1"
         - name: NIM_TRITON_RATE_LIMIT
           value: "3"
-        - name: CUDA_VISIBLE_DEVICES
-          value: "0"
         - name: NIM_TRITON_MAX_BATCH_SIZE
           value: "32"
         - name: NIM_TRITON_CUDA_MEMORY_POOL_MB
@@ -1117,7 +1111,7 @@ nv-ingest:
           volumeAccessMode: "ReadWriteOnce"
           storageClass: ""
       tolerations: []
-      replicaCount: 1
+      replicas: 1
       image:
         repository: nvcr.io/nim/nvidia/nemotron-page-elements-v3
         tag: "1.8.0"
@@ -1126,14 +1120,8 @@ nv-ingest:
           value: "8000"
         - name: NIM_TRITON_LOG_VERBOSE
           value: "1"
-        - name: NIM_TRITON_RATE_LIMIT
-          value: "3"
-        - name: CUDA_VISIBLE_DEVICES
-          value: "0"
         - name: NIM_TRITON_MAX_BATCH_SIZE
           value: "32"
-        - name: NIM_TRITON_CUDA_MEMORY_POOL_MB
-          value: "2048"
         - name: NIM_TRITON_CPU_THREADS_PRE_PROCESSOR
           value: "2"
         - name: NIM_TRITON_CPU_THREADS_POST_PROCESSOR
@@ -1141,7 +1129,7 @@ nv-ingest:
         - name: OMP_NUM_THREADS
           value: "2"
         - name: NIM_ENABLE_OTEL
-          value: "true"
+          value: "0"
         - name: NIM_OTEL_SERVICE_NAME
           value: "page-elements"
         - name: NIM_OTEL_TRACES_EXPORTER
@@ -1150,6 +1138,8 @@ nv-ingest:
           value: "console"
         - name: NIM_OTEL_EXPORTER_OTLP_ENDPOINT
           value: "http://otel-collector:4318"
+        - name: NIM_ENABLE_OTEL
+          value: "true"
         - name: TRITON_OTEL_URL
           value: "http://otel-collector:4318/v1/traces"
         - name: TRITON_OTEL_RATE
@@ -1168,7 +1158,7 @@ nv-ingest:
           storageClass: ""
           volumeAccessMode: "ReadWriteOnce"
       tolerations: []
-      replicaCount: 1
+      replicas: 1
       image:
         repository: nvcr.io/nim/nvidia/nemotron-table-structure-v1
         tag: "1.8.0"
@@ -1179,8 +1169,6 @@ nv-ingest:
           value: "1"
         - name: NIM_TRITON_RATE_LIMIT
           value: "3"
-        - name: CUDA_VISIBLE_DEVICES
-          value: "0"
         - name: NIM_TRITON_MAX_BATCH_SIZE
           value: "32"
         - name: NIM_TRITON_CUDA_MEMORY_POOL_MB

@@ -1,17 +1,21 @@
 services:
   nim-llm:
     container_name: nim-llm-ms
-    image: nvcr.io/nim/nvidia/llama-3.3-nemotron-super-49b-v1.5:1.14.0
+    image: nvcr.io/nim/nvidia/nemotron-3-super-120b-a12b:1.8.0
     shm_size: 16GB
     volumes:
     - ${MODEL_DIRECTORY:-./}:/opt/nim/.cache
-    user: "${USERID}"
+    # TODO: Change user to "${USERID}" when fix is available in the image.
+    user: "0"
     ports:
     - "8999:8000"
     expose:
     - "8000"
     environment:
       NGC_API_KEY: ${NGC_API_KEY}
+      NIM_ENABLE_CHUNKED_PREFILL: "1"
+      NIM_KV_CACHE_DTYPE: "fp8"
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
     ulimits:
       nofile:
         soft: 65536
@@ -22,7 +26,7 @@ services:
           devices:
             - driver: nvidia
               #count: ${INFERENCE_GPU_COUNT:-all}
-              device_ids: ['${LLM_MS_GPU_ID:-1}']
+              device_ids: ['${LLM_MS_GPU_ID:-1}', '${LLM_MS_GPU_ID2:-2}']
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/v1/health/ready')"]
@@ -130,11 +134,8 @@ services:
     environment:
       - NIM_HTTP_API_PORT=8000
       - NIM_TRITON_LOG_VERBOSE=1
-      - NIM_TRITON_RATE_LIMIT=3
       - NGC_API_KEY=${NIM_NGC_API_KEY:-${NGC_API_KEY:-ngcapikey}}
-      - CUDA_VISIBLE_DEVICES=0
       - NIM_TRITON_MAX_BATCH_SIZE=${PAGE_ELEMENTS_BATCH_SIZE:-32}
-      - NIM_TRITON_CUDA_MEMORY_POOL_MB=${PAGE_ELEMENTS_CUDA_MEMORY_POOL_MB:-2048}
       - NIM_TRITON_CPU_THREADS_PRE_PROCESSOR=${PAGE_ELEMENTS_CPU_THREADS_PRE_PROCESSOR:-2}
       - NIM_TRITON_CPU_THREADS_POST_PROCESSOR=${PAGE_ELEMENTS_CPU_THREADS_POST_PROCESSOR:-1}
       - OMP_NUM_THREADS=2
@@ -170,7 +171,6 @@ services:
       - NIM_TRITON_LOG_VERBOSE=1
       - NIM_TRITON_RATE_LIMIT=3
       - NGC_API_KEY=${NIM_NGC_API_KEY:-${NGC_API_KEY:-ngcapikey}}
-      - CUDA_VISIBLE_DEVICES=0
       - NIM_TRITON_MAX_BATCH_SIZE=${GRAPHIC_ELEMENTS_BATCH_SIZE:-32}
       - NIM_TRITON_CUDA_MEMORY_POOL_MB=${GRAPHIC_ELEMENTS_CUDA_MEMORY_POOL_MB:-2048}
       - OMP_NUM_THREADS=1
@@ -196,7 +196,6 @@ services:
       - NIM_TRITON_LOG_VERBOSE=1
       - NIM_TRITON_RATE_LIMIT=3
       - NGC_API_KEY=${NIM_NGC_API_KEY:-${NGC_API_KEY:-ngcapikey}}
-      - CUDA_VISIBLE_DEVICES=0
       - NIM_TRITON_MAX_BATCH_SIZE=${TABLE_STRUCTURE_BATCH_SIZE:-32}
       - NIM_TRITON_CUDA_MEMORY_POOL_MB=${TABLE_STRUCTURE_CUDA_MEMORY_POOL_MB:-2048}
       - OMP_NUM_THREADS=1
@@ -234,8 +233,8 @@ services:
               capabilities: [gpu]
     profiles: ["paddle"]
 
-  nemoretriever-ocr:
-    image: ${NEMORETRIEVER_OCR_IMAGE:-nvcr.io/nim/nvidia/nemoretriever-ocr-v1}:${NEMORETRIEVER_OCR_TAG:-1.2.1}
+  nemotron-ocr:
+    image: ${NEMOTRON_OCR_IMAGE:-nvcr.io/nim/nvidia/nemotron-ocr-v1}:${NEMOTRON_OCR_TAG:-1.3.0}
     shm_size: 16gb
     ports:
       - "8012:8000"
@@ -247,9 +246,7 @@ services:
       - NIM_HTTP_API_PORT=8000
       - NIM_TRITON_LOG_VERBOSE=1
       - NGC_API_KEY=${NIM_NGC_API_KEY:-${NGC_API_KEY:-ngcapikey}}
-      - CUDA_VISIBLE_DEVICES=0
       - NIM_TRITON_MAX_BATCH_SIZE=${OCR_BATCH_SIZE:-32}
-      - NIM_TRITON_ENABLE_MODEL_CONTROL=1
     deploy:
       resources:
         reservations:
@@ -257,7 +254,7 @@ services:
             - driver: nvidia
               device_ids: ["${OCR_MS_GPU_ID:-${PADDLE_MS_GPU_ID:-0}}"]
               capabilities: [gpu]
-    profiles: ["", "ingest", "vlm-ingest", "nemoretriever-ocr"]
+    profiles: ["", "ingest", "vlm-ingest", "nemotron-ocr"]
 
   # Optional NIM microservices
   nemotron-parse:
@@ -273,7 +270,6 @@ services:
       - NIM_TRITON_LOG_VERBOSE=1
       - NVIDIA_API_KEY=${NGC_API_KEY:-nvidiaapikey}
       - NGC_API_KEY=${NGC_API_KEY:-nvidiaapikey}
-      - CUDA_VISIBLE_DEVICES=0
     deploy:
       resources:
         reservations:
@@ -306,7 +302,7 @@ services:
 
   vlm-ms:
     container_name: nemo-vlm-microservice
-    image: nvcr.io/nim/nvidia/nemotron-nano-12b-v2-vl:1.5.0
+    image: nvcr.io/nim/nvidia/nemotron-nano-12b-v2-vl:1.6.0
     volumes:
     - ${MODEL_DIRECTORY:-./}:/opt/nim/.cache
     ports:

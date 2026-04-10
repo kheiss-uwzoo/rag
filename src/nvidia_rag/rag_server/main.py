@@ -38,7 +38,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from traceback import print_exc
 from typing import Any
@@ -90,11 +90,18 @@ from nvidia_rag.utils.filter_expression_generator import (
 )
 from nvidia_rag.utils.health_models import RAGHealthResponse
 from nvidia_rag.utils.llm import (
+    TokenUsageCaptureHandler,
     get_llm,
     get_prompts,
     get_streaming_filter_think_parser_async,
 )
 from nvidia_rag.utils.observability.otel_metrics import OtelMetrics
+from nvidia_rag.utils.observability.tracing import (
+    get_tracer,
+    set_span_llm_usage,
+    traced_span,
+    usage_collector_scope,
+)
 from nvidia_rag.utils.reranker import get_ranking_model
 from nvidia_rag.utils.vdb import _get_vdb_op
 from nvidia_rag.utils.vdb.vdb_base import VDBRag
@@ -412,6 +419,8 @@ class NvidiaRAG:
         filter_expr: str | list[dict[str, Any]] = "",
         enable_query_decomposition: bool | None = None,
         confidence_threshold: float | None = None,
+        fetch_full_page_context: bool | None = None,
+        fetch_neighboring_pages: int | None = None,
         rag_start_time_sec: float | None = None,
         metrics: OtelMetrics | None = None,
     ) -> AsyncGenerator[str, None]:
@@ -458,7 +467,7 @@ class NvidiaRAG:
         logger.info("  - temperature: %s, top_p: %s, max_tokens: %s", temperature, top_p, max_tokens)
         logger.info("  - model: %s", model)
         logger.info("-" * 80)
-        
+
         # Apply defaults from config for None values
         model_params = self.config.llm.get_model_parameters()
         temperature = (
@@ -540,6 +549,16 @@ class NvidiaRAG:
             if confidence_threshold is not None
             else self.config.default_confidence_threshold
         )
+        fetch_full_page_context = (
+            fetch_full_page_context
+            if fetch_full_page_context is not None
+            else self.config.retriever.fetch_full_page_context
+        )
+        fetch_neighboring_pages = (
+            fetch_neighboring_pages
+            if fetch_neighboring_pages is not None
+            else self.config.retriever.fetch_neighboring_pages
+        )
 
         vdb_op = self._prepare_vdb_op(
             vdb_endpoint=vdb_endpoint,
@@ -580,12 +599,12 @@ class NvidiaRAG:
             collection_names = [self.config.vector_store.default_collection_name]
 
         query, chat_history = prepare_llm_request(messages)
-        
+
         # Log extracted query
         query_text = self._extract_text_from_content(query)
         logger.info("Extracted Query: '%s'", query_text[:200] if query_text else "")
         logger.info("Chat History: %d message(s)", len(chat_history) if chat_history else 0)
-        
+
         llm_settings = {
             "model": model,
             "llm_endpoint": llm_endpoint,
@@ -649,6 +668,8 @@ class NvidiaRAG:
                 vdb_op=vdb_op,
                 enable_query_decomposition=enable_query_decomposition,
                 confidence_threshold=confidence_threshold,
+                fetch_full_page_context=fetch_full_page_context,
+                fetch_neighboring_pages=fetch_neighboring_pages,
                 rag_start_time_sec=rag_start_time_sec,
                 metrics=metrics,
             )
@@ -1505,9 +1526,9 @@ class NvidiaRAG:
             logger.info("  - Model: %s", model)
             llm_endpoint_display = llm_settings.get("llm_endpoint") or "api catalog"
             logger.info("  - Endpoint: %s", llm_endpoint_display)
-            logger.info("  - Temperature: %s, Top-P: %s, Max Tokens: %s", 
-                       llm_settings.get("temperature"), 
-                       llm_settings.get("top_p"), 
+            logger.info("  - Temperature: %s, Top-P: %s, Max Tokens: %s",
+                       llm_settings.get("temperature"),
+                       llm_settings.get("top_p"),
                        llm_settings.get("max_tokens"))
             logger.info("Input:")
             logger.info("  - Query: '%s'", query_text[:200] if query_text else "")
@@ -1520,13 +1541,16 @@ class NvidiaRAG:
                 | self.StreamingFilterThinkParser
                 | StrOutputParser()
             )
-            # Create async stream generator
+            token_usage: dict[str, Any] = {}
+            usage_callback = TokenUsageCaptureHandler(token_usage)
+            # Create async stream generator (callback captures token usage)
             stream_gen = chain.astream(
-                {"question": query_text}, config={"run_name": "llm-stream"}
+                {"question": query_text},
+                config={"run_name": "llm-stream", "callbacks": [usage_callback]},
             )
             # Eagerly fetch first chunk to trigger any errors before returning response
             prefetched_stream = await self._eager_prefetch_astream(stream_gen)
-            
+
             logger.info("LLM stream initiated successfully (first chunk received)")
             logger.info("-" * 80)
 
@@ -1538,6 +1562,7 @@ class NvidiaRAG:
                     collection_name="",
                     enable_citations=enable_citations,
                     otel_metrics_client=metrics,
+                    token_usage=token_usage,
                 ),
                 status_code=ErrorCodeMapping.SUCCESS,
             )
@@ -1824,6 +1849,56 @@ class NvidiaRAG:
                     status_code=ErrorCodeMapping.BAD_REQUEST,
                 )
 
+    def _record_aggregate_llm_token_usage(
+        self, aggregate_llm_token_usage: dict[str, Any]
+    ) -> None:
+        """Record aggregate LLM token usage per feature to OpenTelemetry span and logs."""
+        if not aggregate_llm_token_usage:
+            return
+        tracer = get_tracer()
+        with tracer.start_as_current_span("rag.aggregate_llm_token_usage") as span:
+            total_in = 0
+            total_out = 0
+            for feature, u in aggregate_llm_token_usage.items():
+                inp = u.get("input_tokens", 0) or 0
+                out = u.get("output_tokens", 0) or 0
+                total = u.get("total_tokens", 0) or (inp + out)
+                if inp > 0 or out > 0:
+                    span.set_attribute(
+                        f"rag.aggregate_llm_token_usage.{feature}.input_tokens", inp
+                    )
+                    span.set_attribute(
+                        f"rag.aggregate_llm_token_usage.{feature}.output_tokens", out
+                    )
+                    span.set_attribute(
+                        f"rag.aggregate_llm_token_usage.{feature}.total_tokens", total
+                    )
+                    logger.info(
+                        "Aggregate LLM token usage [%s]: input_tokens=%d, output_tokens=%d, total_tokens=%d",
+                        feature,
+                        inp,
+                        out,
+                        total,
+                    )
+                total_in += inp
+                total_out += out
+            if total_in > 0 or total_out > 0:
+                span.set_attribute(
+                    "rag.aggregate_llm_token_usage.total_input_tokens", total_in
+                )
+                span.set_attribute(
+                    "rag.aggregate_llm_token_usage.total_output_tokens", total_out
+                )
+                span.set_attribute(
+                    "rag.aggregate_llm_token_usage.total_tokens", total_in + total_out
+                )
+                logger.info(
+                    "Aggregate LLM token usage [TOTAL]: input_tokens=%d, output_tokens=%d, total_tokens=%d",
+                    total_in,
+                    total_out,
+                    total_in + total_out,
+                )
+
     def _extract_text_from_content(self, content: Any) -> str:
         """Extract text content from either string or multimodal content.
 
@@ -1878,7 +1953,7 @@ class NvidiaRAG:
             return content, is_image_query
         elif isinstance(content, list):
             # Build multimodal query with both text and base64 images.
-            
+
             # Process text types first, then image_url types.
             text_items = [
                 item for item in content
@@ -1888,7 +1963,7 @@ class NvidiaRAG:
                 item for item in content
                 if isinstance(item, dict) and item.get("type") == "image_url"
             ]
-            
+
             # Extract text and image parts in separate lists
             text_parts = []
             image_parts = []
@@ -1902,7 +1977,7 @@ class NvidiaRAG:
                     image_parts.append(image_url)
                     is_image_query = True
                     break # only one image is supported
-            
+
             text_query = "\n\n".join(text_parts)
             if image_parts:
                 image_str = " ".join(image_parts)
@@ -1935,6 +2010,8 @@ class NvidiaRAG:
         vdb_op: VDBRag | None = None,
         enable_query_decomposition: bool = False,
         confidence_threshold: float | None = None,
+        fetch_full_page_context: bool = False,
+        fetch_neighboring_pages: int = 0,
         rag_start_time_sec: float | None = None,
         metrics: OtelMetrics | None = None,
     ) -> tuple[AsyncGenerator[str, None], list[dict[str, Any]]]:
@@ -1960,6 +2037,8 @@ class NvidiaRAG:
             filter_expr: Filter expression to filter document from vector DB
             enable_filter_generator: Whether to enable automatic filter generation
             enable_query_decomposition: Whether to use iterative query decomposition for complex queries
+            fetch_full_page_context: Fetch all chunks for retrieved pages, grouped by page for LLM/VLM
+            fetch_neighboring_pages: Number of pages before/after each retrieved page to include (0=disabled)
         """
         # TODO: Remove image whille printing logs and add image as place holder to not pollute logs
         logger.info(
@@ -2141,6 +2220,8 @@ class NvidiaRAG:
             # Query used for specific tasks (filter generation, reflection) - stays clean without history concatenation
             processed_query = retriever_query
 
+            aggregate_llm_token_usage: dict[str, Any] = {}
+
             # Handle multi-turn conversations with two different strategies:
             # 1. Query rewriting: Creates a standalone, context-aware query (good for both retrieval and tasks)
             # 2. Query combination: Concatenates history for retrieval, keeps original for specific tasks
@@ -2156,7 +2237,7 @@ class NvidiaRAG:
                     logger.info("  - Query: '%s'", retriever_query[:200] if retriever_query else "")
                     logger.info("  - Chat History Messages: %d", len(chat_history) if chat_history else 0)
                     logger.info("-" * 80)
-                    
+
                     # Skip query rewriting if conversation history is disabled
                     if conversation_history_count == 0:
                         logger.warning(
@@ -2234,13 +2315,23 @@ class NvidiaRAG:
                             logger.warning("Could not format prompt for logging: %s", e)
 
                         try:
-                            retriever_query = await q_prompt.ainvoke(
-                                {
-                                    "input": retriever_query,
-                                    "chat_history": formatted_history,
-                                },
-                                config={"run_name": "query-rewriter"},
-                            )
+                            with traced_span("rag.Query Rewriting.token_usage") as qr_span:
+                                with usage_collector_scope(
+                                    aggregate_llm_token_usage, "Query Rewriting"
+                                ):
+                                    retriever_query = await q_prompt.ainvoke(
+                                        {
+                                            "input": retriever_query,
+                                            "chat_history": formatted_history,
+                                        },
+                                        config={"run_name": "query-rewriter"},
+                                    )
+                                u = aggregate_llm_token_usage.get("Query Rewriting") or {}
+                                set_span_llm_usage(
+                                    qr_span,
+                                    u.get("input_tokens", 0),
+                                    u.get("output_tokens", 0),
+                                )
                         except (ConnectionError, OSError, Exception) as e:
                             # Wrap connection errors from query rewriter LLM
                             if isinstance(e, APIError):
@@ -2311,50 +2402,56 @@ class NvidiaRAG:
                     logger.info("  - Collections: %s", validated_collections)
                     logger.info("Generating filter expressions for collections...")
                     logger.info("-" * 80)
-                    
+
+                    run_config_mf = {
+                        "usage_collector": aggregate_llm_token_usage,
+                        "usage_feature": "Custom Metadata",
+                    }
                     try:
+                        with traced_span("rag.Custom Metadata.token_usage") as mf_span:
 
-                        def generate_filter_for_collection(collection_name):
-                            try:
-                                metadata_schema_data = metadata_schemas.get(
-                                    collection_name
-                                )
+                            def generate_filter_for_collection(collection_name):
+                                try:
+                                    metadata_schema_data = metadata_schemas.get(
+                                        collection_name
+                                    )
 
-                                generated_filter = (
-                                    generate_filter_from_natural_language(
-                                        user_request=processed_query,
-                                        collection_name=collection_name,
-                                        metadata_schema=metadata_schema_data,
-                                        prompt_template=self.prompts.get(
-                                            "filter_expression_generator_prompt"
-                                        ),
-                                        llm=self.filter_generator_llm,
-                                        existing_filter_expr=filter_expr,
+                                    generated_filter = (
+                                        generate_filter_from_natural_language(
+                                            user_request=processed_query,
+                                            collection_name=collection_name,
+                                            metadata_schema=metadata_schema_data,
+                                            prompt_template=self.prompts.get(
+                                                "filter_expression_generator_prompt"
+                                            ),
+                                            llm=self.filter_generator_llm,
+                                            existing_filter_expr=filter_expr,
+                                            run_config=run_config_mf,
+                                        )
                                     )
-                                )
 
-                                if generated_filter:
-                                    logger.info(
-                                        f"Generated filter expression for collection '{collection_name}': {generated_filter}"
-                                    )
-                                    processed_filter_expr = process_filter_expr(
-                                        generated_filter,
-                                        collection_name,
-                                        metadata_schema_data,
-                                        is_generated_filter=True,
-                                        config=self.config,
-                                    )
-                                    return collection_name, processed_filter_expr
-                                else:
-                                    logger.info(
-                                        f"No filter expression generated for collection '{collection_name}'"
+                                    if generated_filter:
+                                        logger.info(
+                                            f"Generated filter expression for collection '{collection_name}': {generated_filter}"
+                                        )
+                                        processed_filter_expr = process_filter_expr(
+                                            generated_filter,
+                                            collection_name,
+                                            metadata_schema_data,
+                                            is_generated_filter=True,
+                                            config=self.config,
+                                        )
+                                        return collection_name, processed_filter_expr
+                                    else:
+                                        logger.info(
+                                            f"No filter expression generated for collection '{collection_name}'"
+                                        )
+                                        return collection_name, ""
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Error generating filter for collection '{collection_name}': {str(e)}"
                                     )
                                     return collection_name, ""
-                            except Exception as e:
-                                logger.warning(
-                                    f"Error generating filter for collection '{collection_name}': {str(e)}"
-                                )
-                                return collection_name, ""
 
                         with ThreadPoolExecutor() as executor:
                             futures = [
@@ -2370,12 +2467,19 @@ class NvidiaRAG:
                                     processed_filter_expr
                                 )
 
+                            u = aggregate_llm_token_usage.get("Custom Metadata") or {}
+                            set_span_llm_usage(
+                                mf_span,
+                                u.get("input_tokens", 0),
+                                u.get("output_tokens", 0),
+                            )
+
                         generated_count = len(
                             [f for f in collection_filter_mapping.values() if f]
                         )
                         if generated_count > 0:
                             logger.info("Filter Generation Output:")
-                            logger.info("  - Successfully generated filters for %d/%d collections", 
+                            logger.info("  - Successfully generated filters for %d/%d collections",
                                        generated_count, len(validated_collections))
                             for coll_name, filter_val in collection_filter_mapping.items():
                                 if filter_val:
@@ -2407,25 +2511,36 @@ class NvidiaRAG:
                 logger.info("  - Confidence Threshold: %.2f", confidence_threshold)
                 logger.info("Starting iterative query decomposition...")
                 logger.info("-" * 80)
-                
-                # TODO: Pass processed_query instead of query and check accuracy
-                return await iterative_query_decomposition(
-                    query=query,
-                    history=conversation_history,
-                    llm=llm,
-                    vdb_op=vdb_op,
-                    ranker=ranker if enable_reranker else None,
-                    recursion_depth=self.config.query_decomposition.recursion_depth,
-                    enable_citations=enable_citations,
-                    collection_name=validated_collections[0]
-                    if validated_collections
-                    else "",
-                    top_k=top_k,
-                    ranker_top_k=reranker_top_k,
-                    confidence_threshold=confidence_threshold,
-                    llm_settings=llm_settings,
-                    prompts=self.prompts,
-                )
+
+                with traced_span("rag.Query Decomposition.token_usage") as qd_span:
+                    with usage_collector_scope(
+                        aggregate_llm_token_usage, "Query Decomposition"
+                    ):
+                        result = await iterative_query_decomposition(
+                            query=query,
+                            history=conversation_history,
+                            llm=llm,
+                            vdb_op=vdb_op,
+                            ranker=ranker if enable_reranker else None,
+                            recursion_depth=self.config.query_decomposition.recursion_depth,
+                            enable_citations=enable_citations,
+                            collection_name=validated_collections[0]
+                            if validated_collections
+                            else "",
+                            top_k=top_k,
+                            ranker_top_k=reranker_top_k,
+                            confidence_threshold=confidence_threshold,
+                            llm_settings=llm_settings,
+                            prompts=self.prompts,
+                        )
+                    u = aggregate_llm_token_usage.get("Query Decomposition") or {}
+                    set_span_llm_usage(
+                        qd_span,
+                        u.get("input_tokens", 0),
+                        u.get("output_tokens", 0),
+                    )
+                self._record_aggregate_llm_token_usage(aggregate_llm_token_usage)
+                return result
 
             if confidence_threshold > 0.0 and not enable_reranker:
                 logger.warning(
@@ -2446,41 +2561,53 @@ class NvidiaRAG:
                 logger.info("  - Relevance Threshold: %d", self.config.reflection.context_relevance_threshold)
                 logger.info("Starting context relevance check...")
                 logger.info("-" * 80)
-                
+
                 context_reflection_counter = ReflectionCounter(self.config.reflection.max_loops)
 
-                try:
-                    context_to_show, is_relevant = await check_context_relevance(
-                        vdb_op=vdb_op,
-                        retriever_query=processed_query,
-                        collection_names=validated_collections,
-                        ranker=ranker,
-                        reflection_counter=context_reflection_counter,
-                        top_k=top_k,
-                        enable_reranker=enable_reranker,
-                        collection_filter_mapping=collection_filter_mapping,
-                        config=self.config,
-                        prompts=self.prompts,
+                with traced_span(
+                    "rag.Self Reflection.context_relevance.token_usage"
+                ) as ref_span:
+                    with usage_collector_scope(
+                        aggregate_llm_token_usage, "Self Reflection"
+                    ):
+                        try:
+                            context_to_show, is_relevant = await check_context_relevance(
+                                vdb_op=vdb_op,
+                                retriever_query=processed_query,
+                                collection_names=validated_collections,
+                                ranker=ranker,
+                                reflection_counter=context_reflection_counter,
+                                top_k=top_k,
+                                enable_reranker=enable_reranker,
+                                collection_filter_mapping=collection_filter_mapping,
+                                config=self.config,
+                                prompts=self.prompts,
+                            )
+                        except (
+                            ConnectionError,
+                            OSError,
+                            requests.exceptions.ConnectionError,
+                        ) as e:
+                            # Wrap connection errors from reflection LLM with proper message
+                            reflection_llm_endpoint = self.config.reflection.server_url
+                            endpoint_msg = (
+                                f" at {reflection_llm_endpoint}"
+                                if reflection_llm_endpoint
+                                else ""
+                            )
+                            raise APIError(
+                                f"Reflection LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable reflection.",
+                                ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                            ) from e
+                        except APIError:
+                            # Re-raise APIError as-is
+                            raise
+                    u = aggregate_llm_token_usage.get("Self Reflection") or {}
+                    set_span_llm_usage(
+                        ref_span,
+                        u.get("input_tokens", 0),
+                        u.get("output_tokens", 0),
                     )
-                except (
-                    ConnectionError,
-                    OSError,
-                    requests.exceptions.ConnectionError,
-                ) as e:
-                    # Wrap connection errors from reflection LLM with proper message
-                    reflection_llm_endpoint = self.config.reflection.server_url
-                    endpoint_msg = (
-                        f" at {reflection_llm_endpoint}"
-                        if reflection_llm_endpoint
-                        else ""
-                    )
-                    raise APIError(
-                        f"Reflection LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable reflection.",
-                        ErrorCodeMapping.SERVICE_UNAVAILABLE,
-                    ) from e
-                except APIError:
-                    # Re-raise APIError as-is
-                    raise
 
                 # Normalize scores to 0-1 range
                 if ranker and enable_reranker:
@@ -2516,12 +2643,12 @@ class NvidiaRAG:
                     logger.info("  - Collections: %s", validated_collections)
                     logger.info("  - VDB Top-K: %d", top_k)
                     logger.info("  - Reranker Top-K: %d", reranker_top_k)
-                    logger.info("  - Filter Expressions: %s", 
-                               {k: v[:50] + "..." if len(v) > 50 else v 
+                    logger.info("  - Filter Expressions: %s",
+                               {k: v[:50] + "..." if len(v) > 50 else v
                                 for k, v in collection_filter_mapping.items()})
                     logger.info("Starting parallel retrieval from collections...")
                     logger.info("-" * 80)
-                    
+
                     context_reranker = RunnableAssign(
                         {
                             "context": lambda input: ranker.compress_documents(
@@ -2590,16 +2717,17 @@ class NvidiaRAG:
                         time.time() - context_reranker_start_time
                     ) * 1000
                     context_to_show = docs.get("context", [])
-                    
+
                     # Normalize scores to 0-1 range
                     context_to_show = self._normalize_relevance_scores(context_to_show)
-                    
+
                     logger.info("Reranking Output:")
                     logger.info("  - Reranked Documents: %d", len(context_to_show))
                     logger.info("  - Reranking Time: %.2f ms", context_reranker_time_ms)
+                    self._log_retrieved_pages(context_to_show, "Initially retrieved pages")
                     if context_to_show:
                         scores = [doc.metadata.get("relevance_score", "N/A") for doc in context_to_show[:3]]
-                        logger.info("  - Top Document Scores (normalized): %s", 
+                        logger.info("  - Top Document Scores (normalized): %s",
                                    [f"{s:.4f}" if isinstance(s, (int, float)) else s for s in scores])
                     logger.info("-" * 80)
                 else:
@@ -2621,7 +2749,7 @@ class NvidiaRAG:
                     logger.info("  - Is Image Query: %s", is_image_query)
                     logger.info("Starting retrieval...")
                     logger.info("-" * 80)
-                    
+
                     retrieval_start_time = time.time()
                     if is_image_query:
                         docs = vdb_op.retrieval_image_langchain(
@@ -2653,10 +2781,11 @@ class NvidiaRAG:
                         )
                         context_to_show = docs
                     retrieval_time_ms = (time.time() - retrieval_start_time) * 1000
-                    
+
                     logger.info("Retrieval Output:")
                     logger.info("  - Retrieved Documents: %d", len(context_to_show))
                     logger.info("  - Retrieval Time: %.2f ms", retrieval_time_ms)
+                    self._log_retrieved_pages(context_to_show, "Initially retrieved pages")
                     logger.info("-" * 80)
 
             if ranker and enable_reranker and confidence_threshold > 0.0:
@@ -2671,9 +2800,27 @@ class NvidiaRAG:
                     documents=context_to_show,
                     confidence_threshold=confidence_threshold,
                 )
-                
+
                 logger.info("Filtering Output:")
                 logger.info("  - Filtered Documents: %d", len(context_to_show))
+                self._log_retrieved_pages(context_to_show, "Pages after confidence filter")
+                logger.info("-" * 80)
+
+            # Snapshot for citations: only retrieved (and filtered) chunks, not expanded context.
+            docs_for_citations = list(context_to_show)
+
+            if fetch_full_page_context and context_to_show:
+                logger.info("=" * 80)
+                logger.info("STAGE: Page Context Expansion")
+                logger.info("=" * 80)
+                context_to_show = self._expand_and_organize_context(
+                    docs=context_to_show,
+                    vdb_op=vdb_op,
+                    fetch_full_page_context=fetch_full_page_context,
+                    fetch_neighboring_pages=fetch_neighboring_pages,
+                )
+                logger.info("  - Final Documents: %d", len(context_to_show))
+                self._log_expanded_context_layout(context_to_show, "After expansion (chunks per page)")
                 logger.info("-" * 80)
 
             if enable_vlm_inference or is_image_query:
@@ -2735,14 +2882,14 @@ class NvidiaRAG:
                             vlm_settings.get("vlm_max_total_images")
                             or self.config.vlm.max_total_images
                         )
-                        
+
                         logger.info("=" * 80)
                         logger.info("STAGE: VLM Generation (Vision Language Model)")
                         logger.info("=" * 80)
                         logger.info("VLM Configuration:")
                         logger.info("  - Model: %s", vlm_model_cfg)
                         logger.info("  - Endpoint: %s", vlm_endpoint_cfg)
-                        logger.info("  - Temperature: %s, Top-P: %s, Max Tokens: %s", 
+                        logger.info("  - Temperature: %s, Top-P: %s, Max Tokens: %s",
                                    vlm_temperature_cfg, vlm_top_p_cfg, vlm_max_tokens_cfg)
                         logger.info("  - Max Total Images: %d", vlm_max_total_images_cfg)
                         logger.info("Input:")
@@ -2764,12 +2911,21 @@ class NvidiaRAG:
                             *(chat_history or []),
                             {"role": "user", "content": query},
                         ]
-                        # Build textual context identical to LLM "context" (before mutation below)
-                        vlm_text_context = "\n\n".join(
-                            [
-                                self._format_document_with_source(d)
-                                for d in context_to_show
-                            ]
+                        # Build textual context: when organize_by_page, VLM builds interleaved
+                        if fetch_full_page_context:
+                            vlm_text_context = self._format_context_by_page(
+                                context_to_show,
+                                self._format_document_with_source,
+                            )
+                        else:
+                            vlm_text_context = "\n\n".join(
+                                [
+                                    self._format_document_with_source(d)
+                                    for d in context_to_show
+                                ]
+                            )
+                        self._log_context_structure(
+                            vlm_text_context, "VLM text context structure"
                         )
                         # Always stream VLM response directly using async streaming (reasoning gate deprecated)
                         logger.info("Streaming VLM response directly (async).")
@@ -2778,6 +2934,7 @@ class NvidiaRAG:
                             messages=vlm_messages,
                             context_text=vlm_text_context,
                             question_text=self._extract_text_from_content(query),
+                            organize_by_page=fetch_full_page_context,
                             temperature=vlm_temperature_cfg,
                             top_p=vlm_top_p_cfg,
                             max_tokens=vlm_max_tokens_cfg,
@@ -2788,14 +2945,14 @@ class NvidiaRAG:
                         prefetched_vlm_stream = await self._eager_prefetch_astream(
                             vlm_generator
                         )
-                        
+
                         logger.info("VLM stream initiated successfully (first chunk received)")
                         logger.info("-" * 80)
 
                         return RAGResponse(
                             generate_answer_async(
                                 prefetched_vlm_stream,
-                                context_to_show,
+                                docs_for_citations,
                                 model=model,
                                 collection_name=validated_collections[0] if validated_collections else "",
                                 enable_citations=enable_citations,
@@ -2852,17 +3009,26 @@ class NvidiaRAG:
                         "falling back to regular LLM flow."
                     )
 
-            docs = [self._format_document_with_source(d) for d in context_to_show]
+            if fetch_full_page_context:
+                docs = self._format_context_by_page(
+                    context_to_show,
+                    self._format_document_with_source,
+                )
+            else:
+                docs = "\n\n".join(
+                    self._format_document_with_source(d) for d in context_to_show
+                )
 
             logger.info("=" * 80)
             logger.info("STAGE: Context Preparation for LLM")
             logger.info("=" * 80)
             logger.info("Context Configuration:")
             logger.info("  - Final Context Documents: %d", len(context_to_show))
+            self._log_context_structure(docs, "Prompt context structure (to LLM/VLM)")
             if context_to_show:
                 total_context_length = sum(len(d.page_content) for d in context_to_show)
                 logger.info("  - Total Context Length: %d characters", total_context_length)
-                logger.info("  - First Document Preview: %s...", 
+                logger.info("  - First Document Preview: %s...",
                            context_to_show[0].page_content[:100] if context_to_show else "")
             logger.info("-" * 80)
 
@@ -2899,7 +3065,7 @@ class NvidiaRAG:
                        llm_settings.get("max_tokens"))
             logger.info("Input:")
             logger.info("  - Query: '%s'", self._extract_text_from_content(query)[:200])
-            logger.info("  - Context Documents: %d", len(docs))
+            logger.info("  - Context Documents: %d", len(context_to_show))
             logger.info("-" * 80)
 
             chain = prompt | llm | self.StreamingFilterThinkParser | StrOutputParser()
@@ -2919,42 +3085,61 @@ class NvidiaRAG:
                 logger.info("  - Groundedness Threshold: %d", self.config.reflection.response_groundedness_threshold)
                 logger.info("Starting LLM generation with reflection enabled...")
                 logger.info("-" * 80)
-                
+
                 response_reflection_counter = ReflectionCounter(
                     self.config.reflection.max_loops
                 )
-                initial_response = await chain.ainvoke(
-                    {"question": query, "context": docs}
+                reflection_usage_before = dict(
+                    (aggregate_llm_token_usage.get("Self Reflection") or {}).items()
                 )
-                logger.info("Initial LLM response generated, checking groundedness...")
-                try:
-                    final_response, is_grounded = await check_response_groundedness(
-                        query,
-                        initial_response,
-                        docs,
-                        response_reflection_counter,
-                        config=self.config,
-                        prompts=self.prompts,
-                    )
-                except (
-                    ConnectionError,
-                    OSError,
-                    requests.exceptions.ConnectionError,
-                ) as e:
-                    # Wrap connection errors from reflection LLM with proper message
-                    reflection_llm_endpoint = self.config.reflection.server_url
-                    endpoint_msg = (
-                        f" at {reflection_llm_endpoint}"
-                        if reflection_llm_endpoint
-                        else ""
-                    )
-                    raise APIError(
-                        f"Reflection LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable reflection.",
-                        ErrorCodeMapping.SERVICE_UNAVAILABLE,
-                    ) from e
-                except APIError:
-                    # Re-raise APIError as-is
-                    raise
+                with traced_span(
+                    "rag.Self Reflection.response_groundedness.token_usage"
+                ) as ref_rg_span:
+                    with usage_collector_scope(
+                        aggregate_llm_token_usage, "Self Reflection"
+                    ):
+                        token_usage_reflection: dict[str, Any] = {}
+                        usage_callback_reflection = TokenUsageCaptureHandler(
+                            token_usage_reflection
+                        )
+                        initial_response = await chain.ainvoke(
+                            {"question": query, "context": docs},
+                            config={"callbacks": [usage_callback_reflection]},
+                        )
+                        logger.info("Initial LLM response generated, checking groundedness...")
+                        try:
+                            final_response, is_grounded = await check_response_groundedness(
+                                query,
+                                initial_response,
+                                docs,
+                                response_reflection_counter,
+                                config=self.config,
+                                prompts=self.prompts,
+                            )
+                        except (
+                            ConnectionError,
+                            OSError,
+                            requests.exceptions.ConnectionError,
+                        ) as e:
+                            # Wrap connection errors from reflection LLM with proper message
+                            reflection_llm_endpoint = self.config.reflection.server_url
+                            endpoint_msg = (
+                                f" at {reflection_llm_endpoint}"
+                                if reflection_llm_endpoint
+                                else ""
+                            )
+                            raise APIError(
+                                f"Reflection LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable reflection.",
+                                ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                            ) from e
+                        except APIError:
+                            # Re-raise APIError as-is
+                            raise
+                    u_after = aggregate_llm_token_usage.get("Self Reflection") or {}
+                    delta_in = u_after.get("input_tokens", 0) - reflection_usage_before.get("input_tokens", 0)
+                    delta_out = u_after.get("output_tokens", 0) - reflection_usage_before.get("output_tokens", 0)
+                    if delta_in > 0 or delta_out > 0:
+                        set_span_llm_usage(ref_rg_span, delta_in, delta_out)
                 logger.info("Reflection Output:")
                 logger.info("  - Response Grounded: %s", is_grounded)
                 logger.info("  - Reflection Iterations: %d", response_reflection_counter.current_count)
@@ -2967,11 +3152,12 @@ class NvidiaRAG:
                 logger.info("=" * 80)
                 logger.info("RAG PIPELINE COMPLETE")
                 logger.info("=" * 80)
-                
+
+                self._record_aggregate_llm_token_usage(aggregate_llm_token_usage)
                 return RAGResponse(
                     generate_answer_async(
                         _async_iter([final_response]),
-                        context_to_show,
+                        docs_for_citations,
                         model=model,
                         collection_name=validated_collections[0] if validated_collections else "",
                         enable_citations=enable_citations,
@@ -2979,29 +3165,33 @@ class NvidiaRAG:
                         retrieval_time_ms=retrieval_time_ms,
                         rag_start_time_sec=rag_start_time_sec,
                         otel_metrics_client=metrics,
+                        token_usage=token_usage_reflection,
                     ),
                     status_code=ErrorCodeMapping.SUCCESS,
                 )
             else:
                 logger.info("Starting LLM stream generation...")
-                # Create async stream generator
+                token_usage_rag: dict[str, Any] = {}
+                usage_callback_rag = TokenUsageCaptureHandler(token_usage_rag)
+                # Create async stream generator (callback captures token usage)
                 stream_gen = chain.astream(
                     {"question": query, "context": docs},
-                    config={"run_name": "llm-stream"},
+                    config={"run_name": "llm-stream", "callbacks": [usage_callback_rag]},
                 )
                 # Eagerly fetch first chunk to trigger any errors before returning response
                 prefetched_stream = await self._eager_prefetch_astream(stream_gen)
-                
+
                 logger.info("LLM stream initiated successfully (first chunk received)")
                 logger.info("-" * 80)
                 logger.info("=" * 80)
                 logger.info("RAG PIPELINE COMPLETE - Starting response streaming")
                 logger.info("=" * 80)
 
+                self._record_aggregate_llm_token_usage(aggregate_llm_token_usage)
                 return RAGResponse(
                     generate_answer_async(
                         prefetched_stream,
-                        context_to_show,
+                        docs_for_citations,
                         model=model,
                         collection_name=validated_collections[0] if validated_collections else "",
                         enable_citations=enable_citations,
@@ -3009,6 +3199,7 @@ class NvidiaRAG:
                         retrieval_time_ms=retrieval_time_ms,
                         rag_start_time_sec=rag_start_time_sec,
                         otel_metrics_client=metrics,
+                        token_usage=token_usage_rag,
                     ),
                     status_code=ErrorCodeMapping.SUCCESS,
                 )
@@ -3168,6 +3359,305 @@ class NvidiaRAG:
                 doc.metadata["relevance_score"] = normalized_score
 
         return documents
+
+    def _log_retrieved_pages(
+        self, docs: list[Document], prefix: str = "Retrieved pages"
+    ) -> None:
+        """Log page number for every retrieved doc (no dedup), so redundant pages are visible."""
+        if not docs:
+            logger.info("  [%s] (none)", prefix)
+            return
+        by_source: dict[str, list[int]] = {}
+        no_page_count = 0
+        for doc in docs:
+            meta = getattr(doc, "metadata", {}) or {}
+            content_md = meta.get("content_metadata", {}) or {}
+            page_num = content_md.get("page_number")
+            source = meta.get("source", {})
+            source_path = (
+                source.get("source_name", "")
+                if isinstance(source, dict)
+                else source
+            )
+            name = (
+                os.path.basename(str(source_path))
+                if source_path
+                else "unknown"
+            )
+            if page_num is not None:
+                if name not in by_source:
+                    by_source[name] = []
+                by_source[name].append(int(page_num))
+            else:
+                no_page_count += 1
+        # Keep full list in doc order (no set/sort) so user can confirm each chunk's page
+        parts = [
+            f"{name} -> {len(pages)} chunks: {','.join(map(str, pages))}"
+            for name, pages in sorted(by_source.items())
+        ]
+        if no_page_count:
+            parts.append(f"(no page: {no_page_count} chunks)")
+        logger.info("  [%s] %s", prefix, "; ".join(parts))
+
+    def _log_expanded_context_layout(
+        self, docs: list[Document], prefix: str = "Context layout"
+    ) -> None:
+        """Log how context is arranged after expansion: chunks per (source, page)."""
+        if not docs:
+            logger.info("  [%s] (none)", prefix)
+            return
+        grouped: dict[tuple[str, int], int] = {}
+        no_page_count = 0
+        for doc in docs:
+            meta = getattr(doc, "metadata", {}) or {}
+            content_md = meta.get("content_metadata", {}) or {}
+            page_num = content_md.get("page_number")
+            source = meta.get("source", {})
+            source_path = (
+                source.get("source_name", "")
+                if isinstance(source, dict)
+                else source
+            )
+            name = (
+                os.path.basename(str(source_path))
+                if source_path
+                else "unknown"
+            )
+            if page_num is not None:
+                key = (name, int(page_num))
+                grouped[key] = grouped.get(key, 0) + 1
+            else:
+                no_page_count += 1
+        parts = [
+            f"{name} p{p} -> {c} chunk(s)"
+            for (name, p), c in sorted(grouped.items())
+        ]
+        if no_page_count:
+            parts.append(f"(no page: {no_page_count} chunks)")
+        logger.info("  [%s] %s", prefix, "; ".join(parts))
+
+    def _log_context_structure(
+        self,
+        context_str: str,
+        prefix: str = "Context structure",
+        max_chars: int = 60,
+    ) -> None:
+        """Log a short summary of context passed to LLM/VLM (sections + length, no full text)."""
+        if not (context_str or "").strip():
+            logger.info("  [%s] (empty)", prefix)
+            return
+        parts_log: list[str] = []
+        current_header: str | None = None
+        current_len = 0
+        for line in (context_str or "").splitlines():
+            if line.strip().startswith("==="):
+                if current_header is not None:
+                    parts_log.append(f"{current_header} ({current_len} chars)")
+                current_header = line.strip()[:50]
+                current_len = 0
+            else:
+                current_len += len(line) + 1
+        if current_header is not None:
+            parts_log.append(f"{current_header} ({current_len} chars)")
+        elif current_len:
+            parts_log.append(f"<context> ({current_len} chars)")
+        if parts_log:
+            logger.info("  [%s] %s", prefix, " | ".join(parts_log[:15]))
+
+    def _extract_page_set_from_docs(
+        self, docs: list[Document]
+    ) -> set[tuple[str, str, int]]:
+        """Extract (collection_name, source_name, page_number) from docs with page metadata."""
+        page_set: set[tuple[str, str, int]] = set()
+        for doc in docs:
+            meta = getattr(doc, "metadata", {}) or {}
+            content_md = meta.get("content_metadata", {}) or {}
+            page_num = content_md.get("page_number")
+            if page_num is None:
+                continue
+            source = meta.get("source", {})
+            source_path = (
+                source.get("source_name", "") if isinstance(source, dict) else source
+            )
+            if not source_path:
+                continue
+            source_name = str(source_path)
+            collection_name = meta.get("collection_name", "")
+            if collection_name:
+                page_set.add((collection_name, source_name, int(page_num)))
+        return page_set
+
+    def _expand_page_set_with_neighbors(
+        self,
+        page_set: set[tuple[str, str, int]],
+        n: int,
+    ) -> set[tuple[str, str, int]]:
+        """Expand page set with n pages before and after each page.
+
+        Safely ignores page 0 (first page - 1) and non-existent pages beyond the last:
+        - page 0: filtered out via new_page >= 1
+        - page N+1: included in fetch; VDB returns empty for non-existent pages
+        """
+        expanded: set[tuple[str, str, int]] = set(page_set)
+        for coll, source, page in page_set:
+            for delta in range(-n, n + 1):
+                if delta == 0:
+                    continue
+                new_page = page + delta
+                if new_page >= 1:
+                    expanded.add((coll, source, new_page))
+        return expanded
+
+    def _expand_and_organize_context(
+        self,
+        docs: list[Document],
+        vdb_op: VDBRag,
+        fetch_full_page_context: bool,
+        fetch_neighboring_pages: int,
+    ) -> list[Document]:
+        """Expand context with full page chunks and/or neighboring pages, then return merged docs.
+
+        When no docs have page_number (e.g., text files), returns reranker top-k unchanged.
+        """
+        page_set = self._extract_page_set_from_docs(docs)
+        if not page_set:
+            return docs  # Text files, no page metadata: return reranker top-k as-is
+
+        if fetch_neighboring_pages > 0:
+            page_set = self._expand_page_set_with_neighbors(
+                page_set, fetch_neighboring_pages
+            )
+
+        if not fetch_full_page_context:
+            return docs
+
+        seen: set[tuple[str, str, int, str]] = set()
+
+        def doc_key(d: Document) -> tuple[str, str, int, str]:
+            """Stable key for deduplication: use location for image/table/chart, else content preview."""
+            meta = getattr(d, "metadata", {}) or {}
+            content_md = meta.get("content_metadata", {}) or {}
+            source = meta.get("source", {})
+            source_path = (
+                source.get("source_name", "") if isinstance(source, dict) else source
+            )
+            coll = meta.get("collection_name", "")
+            page_num = content_md.get("page_number", 0)
+            # Prefer location for multimodal chunks (image/table/chart) to avoid false merges
+            location = content_md.get("location") or content_md.get("image_location")
+            if location is not None:
+                unique_part = str(location)
+            else:
+                unique_part = (getattr(d, "page_content", "") or "")[:300]
+            return (str(coll), str(source_path), int(page_num), unique_part)
+
+        merged: list[Document] = []
+        skipped = 0
+        for d in docs:
+            k = doc_key(d)
+            if k not in seen:
+                seen.add(k)
+                merged.append(d)
+            else:
+                skipped += 1
+
+        pages_by_coll_source: dict[tuple[str, str], set[int]] = {}
+        for coll, source, page in page_set:
+            key = (coll, source)
+            if key not in pages_by_coll_source:
+                pages_by_coll_source[key] = set()
+            pages_by_coll_source[key].add(page)
+
+        if getattr(type(vdb_op), "retrieve_chunks_by_filter", None) is VDBRag.retrieve_chunks_by_filter:
+            logger.warning(
+                "VDB backend %s does not implement retrieve_chunks_by_filter; "
+                "skipping full-page fetch.",
+                type(vdb_op).__name__,
+            )
+            return merged
+
+        for (coll, source), pages in pages_by_coll_source.items():
+            try:
+                fetched = vdb_op.retrieve_chunks_by_filter(
+                    collection_name=coll,
+                    source_name=source,
+                    page_numbers=sorted(pages),
+                    limit=1000,
+                )
+                for d in fetched:
+                    k = doc_key(d)
+                    if k not in seen:
+                        seen.add(k)
+                        merged.append(d)
+                    else:
+                        skipped += 1
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch chunks for source=%s pages=%s: %s",
+                    source,
+                    list(pages),
+                    e,
+                )
+
+        if skipped > 0:
+            logger.info(
+                "Page context expansion: %d unique chunks after deduplication (skipped %d duplicate(s))",
+                len(merged),
+                skipped,
+            )
+        return merged
+
+    def _format_context_by_page(
+        self,
+        docs: list[Document],
+        format_fn: Callable[[Document], str],
+    ) -> str:
+        """Group documents by (source, page_number), sort by page, format with markers."""
+        has_page: list[tuple[str, str, int, Document]] = []
+        no_page: list[Document] = []
+        for doc in docs:
+            meta = getattr(doc, "metadata", {}) or {}
+            content_md = meta.get("content_metadata", {}) or {}
+            page_num = content_md.get("page_number")
+            source = meta.get("source", {})
+            source_path = (
+                source.get("source_name", "") if isinstance(source, dict) else source
+            )
+            filename = (
+                os.path.splitext(os.path.basename(str(source_path)))[0]
+                if source_path
+                else "unknown"
+            )
+            if page_num is not None:
+                has_page.append((filename, str(source_path), int(page_num), doc))
+            else:
+                no_page.append(doc)
+
+        parts: list[str] = []
+        grouped: dict[tuple[str, int], list[Document]] = {}
+        for filename, source_path, page_num, doc in has_page:
+            key = (source_path, page_num)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(doc)
+
+        keys_sorted = sorted(grouped.keys(), key=lambda k: (k[0], k[1]))
+        for (source_path, page_num) in keys_sorted:
+            doc_list = grouped[(source_path, page_num)]
+            filename = (
+                os.path.splitext(os.path.basename(source_path))[0]
+                if source_path
+                else "unknown"
+            )
+            marker = f"=== Page {page_num} ({filename}) ===\n"
+            content = "\n\n".join(format_fn(d) for d in doc_list)
+            parts.append(marker + content)
+
+        if no_page:
+            parts.append("=== Additional context ===\n")
+            parts.append("\n\n".join(format_fn(d) for d in no_page))
+
+        return "\n\n".join(parts)
 
     def _format_document_with_source(self, doc: "Document") -> str:
         """Format document content with its source filename.

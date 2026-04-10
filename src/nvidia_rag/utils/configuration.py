@@ -36,7 +36,7 @@ def Field(default=None, *, env: str = None, description: str = None, **kwargs):
         **kwargs: Other Pydantic Field parameters
 
     Example:
-        name: str = Field(default="milvus", env="APP_VECTORSTORE_NAME", description="Vector store name")
+        name: str = Field(default="elasticsearch", env="APP_VECTORSTORE_NAME", description="Vector store name")
     """
     if env:
         if "json_schema_extra" not in kwargs:
@@ -120,12 +120,12 @@ class VectorStoreConfig(_ConfigBase):
     """
 
     name: str = Field(
-        default="milvus",
+        default="elasticsearch",
         env="APP_VECTORSTORE_NAME",
         description="Name of the vector store backend (e.g., milvus, elasticsearch)",
     )
     url: str = Field(
-        default="http://localhost:19530",
+        default="http://localhost:9200",
         env="APP_VECTORSTORE_URL",
         description="URL endpoint for the vector store service",
     )
@@ -411,6 +411,11 @@ class NvIngestConfig(_ConfigBase):
         env="APP_NVINGEST_PAGES_PER_CHUNK",
         description="Number of pages per chunk for PDF split processing",
     )
+    max_memory_budget_mb: int = Field(
+        default=2048,
+        env="INGESTION_MAX_MEMORY_BUDGET_MB",
+        description="Max memory budget (MB) for a single ingestion job; used for dynamic batch sizing",
+    )
 
 
 class ModelParametersConfig(_ConfigBase):
@@ -491,7 +496,7 @@ class LLMConfig(_ConfigBase):
         description="URL endpoint for the LLM inference service",
     )
     model_name: str = Field(
-        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        default="nvidia/nemotron-3-super-120b-a12b",
         env="APP_LLM_MODELNAME",
         description="Name of the language model to use for generation",
     )
@@ -545,7 +550,7 @@ class QueryRewriterConfig(_ConfigBase):
     """Query Rewriter configuration."""
 
     model_name: str = Field(
-        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        default="nvidia/nemotron-3-super-120b-a12b",
         env="APP_QUERYREWRITER_MODELNAME",
         description="Model for rewriting user queries to improve retrieval",
     )
@@ -585,7 +590,7 @@ class FilterExpressionGeneratorConfig(_ConfigBase):
     """Filter Expression Generator configuration."""
 
     model_name: str = Field(
-        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        default="nvidia/nemotron-3-super-120b-a12b",
         env="APP_FILTEREXPRESSIONGENERATOR_MODELNAME",
         description="Model for generating metadata filter expressions from queries",
     )
@@ -767,6 +772,18 @@ class RetrieverConfig(_ConfigBase):
         env="APP_RETRIEVER_NRPIPELINE",
         description="Retrieval pipeline to use (e.g., ranked_hybrid, dense, sparse)",
     )
+    fetch_full_page_context: bool = Field(
+        default=False,
+        env="APP_FETCH_FULL_PAGE_CONTEXT",
+        description="Fetch ALL chunks for retrieved pages and organize context by page. "
+        "When True, enables page-based grouping for LLM/VLM.",
+    )
+    fetch_neighboring_pages: int = Field(
+        default=0,
+        env="APP_FETCH_NEIGHBORING_PAGES",
+        description="N pages before/after each retrieved page (0=disabled, 1=+/-1 page). "
+        "Requires fetch_full_page_context=True.",
+    )
 
     @field_validator("nr_url", mode="before")
     @classmethod
@@ -790,12 +807,37 @@ class RetrieverConfig(_ConfigBase):
             )
         return v
 
+    @field_validator("fetch_neighboring_pages")
+    @classmethod
+    def validate_fetch_neighboring_pages(cls, v: int) -> int:
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise TypeError(
+                f"fetch_neighboring_pages must be an integer, got {type(v).__name__}"
+            )
+        if v < 0:
+            raise ValueError(
+                f"fetch_neighboring_pages must be >= 0, got {v}"
+            )
+        if v > 10:
+            raise ValueError(
+                f"fetch_neighboring_pages must be <= 10, got {v}"
+            )
+        return v
+
     @model_validator(mode="after")
     def validate_reranker_top_k(self) -> "RetrieverConfig":
         if self.vdb_top_k is not None and self.top_k > self.vdb_top_k:
             raise ValueError(
                 f"reranker_top_k ({self.top_k}) must be less than or equal to vdb_top_k ({self.vdb_top_k}). "
                 "Please check your settings and try again."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_page_context_options(self) -> "RetrieverConfig":
+        if self.fetch_neighboring_pages > 0 and not self.fetch_full_page_context:
+            raise ValueError(
+                "fetch_full_page_context must be True when fetch_neighboring_pages > 0."
             )
         return self
 
@@ -909,7 +951,7 @@ class SummarizerConfig(_ConfigBase):
     """Summarizer configuration."""
 
     model_name: str = Field(
-        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        default="nvidia/nemotron-3-super-120b-a12b",
         env="SUMMARY_LLM",
         description="Model for generating document summaries",
     )
@@ -1009,7 +1051,7 @@ class ReflectionConfig(_ConfigBase):
         description="Maximum number of reflection iterations",
     )
     model_name: str = Field(
-        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        default="nvidia/nemotron-3-super-120b-a12b",
         env="REFLECTION_LLM",
         description="Model for reflection and quality assessment",
     )

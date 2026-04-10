@@ -21,6 +21,7 @@
 5. get_streaming_filter_think_parser: Get the parser for filtering the think tokens (sync).
 6. streaming_filter_think_async: Filter the think tokens from the LLM response (async).
 7. get_streaming_filter_think_parser_async: Get the parser for filtering the think tokens (async).
+8. TokenUsageCaptureHandler: Callback that captures token usage from an LLM call into a dict.
 """
 
 import logging
@@ -28,15 +29,18 @@ import os
 from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import requests
 import yaml
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.llms import LLM
 from langchain_core.language_models.chat_models import SimpleChatModel
+from langchain_core.outputs import LLMResult
 from langchain_core.messages import AIMessageChunk
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-from nvidia_rag.rag_server.response_generator import APIError, ErrorCodeMapping
+from nvidia_rag.rag_server.response_generator import APIError, ErrorCodeMapping, Usage
 from nvidia_rag.utils.common import (
     NVIDIA_API_DEFAULT_HEADERS,
     combine_dicts,
@@ -52,6 +56,64 @@ try:
 except ImportError:
     logger.info("Langchain OpenAI is not installed.")
     pass
+
+
+def _extract_token_usage_from_llm_result(response: LLMResult) -> Usage | None:
+    """Extract token usage from ChatNVIDIA/LLM response (LLMResult)."""
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    # Prefer llm_output (e.g. token_usage / usage)
+    llm_out = response.llm_output or {}
+    token_usage = llm_out.get("token_usage") or llm_out.get("usage")
+    if token_usage:
+        prompt_tokens = (
+            token_usage.get("prompt_tokens")
+            or token_usage.get("input_tokens")
+            or token_usage.get("input_token_count")
+            or 0
+        )
+        completion_tokens = (
+            token_usage.get("completion_tokens")
+            or token_usage.get("output_tokens")
+            or token_usage.get("generated_token_count")
+            or 0
+        )
+        total_tokens = token_usage.get("total_tokens") or (prompt_tokens + completion_tokens)
+    else:
+        # Fallback: usage_metadata on generation.message (ChatNVIDIA streaming)
+        for generations in response.generations:
+            for gen in generations:
+                if (
+                    hasattr(gen, "message")
+                    and hasattr(gen.message, "usage_metadata")
+                    and gen.message.usage_metadata
+                ):
+                    meta = gen.message.usage_metadata
+                    prompt_tokens += meta.get("input_tokens") or meta.get("prompt_tokens") or 0
+                    completion_tokens += meta.get("output_tokens") or meta.get("completion_tokens") or 0
+        total_tokens = prompt_tokens + completion_tokens
+    if total_tokens <= 0:
+        return None
+    return Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+class TokenUsageCaptureHandler(BaseCallbackHandler):
+    """Callback that captures token usage from the single LLM call (ChatNVIDIA) into a holder dict."""
+
+    def __init__(self, token_usage: dict):
+        self.token_usage = token_usage
+
+    def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        usage = _extract_token_usage_from_llm_result(response)
+        if usage is not None:
+            self.token_usage["prompt_tokens"] = usage.prompt_tokens
+            self.token_usage["completion_tokens"] = usage.completion_tokens
+            self.token_usage["total_tokens"] = usage.total_tokens
 
 
 def get_prompts(source: str | dict | None = None) -> dict:
@@ -152,7 +214,14 @@ def _is_nemotron_nano_9b_v2(model: str | None) -> bool:
 
 
 def _resolve_enable_thinking(config: NvidiaRAGConfig | None = None, **kwargs) -> bool:
-    """Resolve enable_thinking from config, kwargs, or deprecated env var fallback."""
+    """Resolve enable_thinking from config, kwargs, or deprecated env var fallback.
+
+    Explicit kwargs take priority over config so callers can opt out of thinking
+    (e.g. reflection tasks that need deterministic, non-thinking responses).
+    """
+    # Explicit kwarg takes highest priority (allows callers to override config)
+    if "enable_thinking" in kwargs:
+        return bool(kwargs["enable_thinking"])
     if config is not None:
         enable = config.llm.parameters.enable_thinking
         if enable:
@@ -477,6 +546,7 @@ def streaming_filter_think(chunks: Iterable[str]) -> Iterable[str]:
         chunk_count += 1
 
         # Accumulate reasoning tokens when DEBUG logging is enabled (e.g. reasoning_content from nemotron-3-nano)
+        reasoning, _ = extract_reasoning_and_content(chunk)
         if reasoning and logger.isEnabledFor(logging.DEBUG):
             reasoning_content_accumulator += reasoning
 
@@ -636,7 +706,6 @@ async def streaming_filter_think_async(chunks, enable_thinking: bool = False):
 
     When DEBUG logging is enabled (i.e. LOGLEVEL=DEBUG), reasoning tokens are
     logged from <think> block content or reasoning_content field.
-
     When enable_thinking is True and the model uses a separate reasoning_content field
     (e.g. Nemotron 3), reasoning tokens are dropped and only content is forwarded.
     The <think> tag filter still runs to handle models that embed reasoning in content.
@@ -677,6 +746,7 @@ async def streaming_filter_think_async(chunks, enable_thinking: bool = False):
         chunk_count += 1
 
         # Accumulate reasoning when DEBUG logging is enabled (e.g. reasoning_content from nemotron-3-nano)
+        reasoning, _ = extract_reasoning_and_content(chunk)
         if reasoning and logger.isEnabledFor(logging.DEBUG):
             reasoning_content_accumulator += reasoning
 
@@ -794,7 +864,7 @@ async def streaming_filter_think_async(chunks, enable_thinking: bool = False):
             yield output_buffer
 
     if think_accumulator and logger.isEnabledFor(logging.DEBUG):
-        logger.debug("Reasoning tokens: %s", think_accumulator.rstrip())
+        logger.debug("Reasoning tokens (think): %s", think_accumulator.rstrip())
     if reasoning_content_accumulator and logger.isEnabledFor(logging.DEBUG):
         logger.debug("Reasoning tokens: %s", reasoning_content_accumulator)
 

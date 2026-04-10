@@ -23,7 +23,7 @@ dependencies = [
     "langchain>=1.2.7",
     "langchain-community>=0.4",
     "langchain-milvus>=0.3.0",
-    "langchain-nvidia-ai-endpoints>=1.2.0",
+    "langchain-nvidia-ai-endpoints>=1.2.1",
     "minio>=7.2,<8.0",
     "pdfplumber>=0.11.9",
     "pydantic>=2.11,<3.0",
@@ -41,7 +41,7 @@ dependencies = [
 
 [project.optional-dependencies]
 rag = [
-    "langchain-openai>=0.2",
+    "langchain-openai>=0.2,<1.1.9",
     "opentelemetry-api>=1.29,<2.0",
     "opentelemetry-exporter-otlp>=1.29,<2.0",
     "opentelemetry-exporter-prometheus>=0.50b0,<1.0",
@@ -58,11 +58,11 @@ rag = [
 ]
 ingest = [
     # nv-ingest dependencies (required for ingestion operations)
-    "nv-ingest-api==26.1.2",
-    "nv-ingest-client==26.1.2",
+    "nv-ingest-api==26.3.0",
+    "nv-ingest-client==26.3.0",
     "tritonclient==2.57.0",
     # Other ingest dependencies
-    "langchain-openai>=0.2",
+    "langchain-openai>=0.2,<1.1.9",
     "overrides>=7.7,<8.0",
     "tqdm>=4.67,<5.0",
     "opentelemetry-api>=1.29,<2.0",
@@ -80,11 +80,11 @@ ingest = [
 ]
 all = [
     # nv-ingest dependencies (required for ingestion operations)
-    "nv-ingest-api==26.1.2",
-    "nv-ingest-client==26.1.2",
+    "nv-ingest-api==26.3.0",
+    "nv-ingest-client==26.3.0",
     "tritonclient==2.57.0",
     # RAG + Ingest dependencies
-    "langchain-openai>=0.2",
+    "langchain-openai>=0.2,<1.1.9",
     "overrides>=7.7,<8.0",
     "tqdm>=4.67,<5.0",
     "opentelemetry-api>=1.29,<2.0",

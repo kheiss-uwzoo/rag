@@ -125,7 +125,7 @@ Use the following procedure to start all containers needed for this blueprint.
         compose-graphic-elements-1    Up 4 minutes
         compose-page-elements-1       Up 4 minutes
         nemotron-embedding-ms    Up 4 minutes (healthy)
-        compose-nemoretriever-ocr-1   Up 4 minutes
+        compose-nemotron-ocr-1   Up 4 minutes
         compose-table-structure-1     Up 4 minutes
      ```
 
@@ -257,7 +257,7 @@ Use the following procedure to start all containers needed for this blueprint.
     7b5ddabf8be7   compose-graphic-elements-1       Up 10 minutes
     ecfaa5190302   compose-page-elements-1          Up 10 minutes
     ea8c7fdf20d1   nemotron-embedding-ms       Up 10 minutes (healthy)
-    6d62008a9b42   compose-nemoretriever-ocr-1      Up 10 minutes
+    6d62008a9b42   compose-nemotron-ocr-1      Up 10 minutes
     969b9f5c987c   compose-table-structure-1        Up 10 minutes
     ```
 
@@ -324,7 +324,7 @@ After the first time you deploy the RAG Blueprint successfully, you can consider
    docker compose -f deploy/compose/docker-compose-*-server.yaml up -d --build
    ```
 
-- By default, GPU accelerated Milvus DB is deployed. You can choose the GPU ID to allocate by using the below env variable. For all service port mappings and GPU assignments, see [Service Port and GPU Reference](service-port-gpu-reference.md).
+By default, Elasticsearch is deployed as the vector database (`vectordb.yaml` with the default profile). Milvus is optional. You can start Milvus with `docker compose -f deploy/compose/vectordb.yaml --profile milvus up -d` and set `APP_VECTORSTORE_NAME` / `APP_VECTORSTORE_URL` for Milvus (see [Vector database configuration](change-vectordb.md)). When you use the Milvus profile, Milvus can run as GPU-accelerated. Choose the GPU ID using the following variables. For all service port mappings and GPU assignments, refer to [Service Port and GPU Reference](service-port-gpu-reference.md).
 
    ```bash
    VECTORSTORE_GPU_DEVICE_ID=0
@@ -333,7 +333,7 @@ After the first time you deploy the RAG Blueprint successfully, you can consider
 - For improved accuracy, consider enabling reasoning mode. For details, refer to [Enable thinking](./enable-nemotron-thinking.md).
 
 
-- NeMo Retriever Library OCR is now the default OCR service. To use legacy Paddle OCR instead, refer to [OCR Configuration Guide](nemoretriever-ocr.md).
+- Nemotron OCR is now the default OCR service. To use legacy Paddle OCR instead, refer to [OCR Configuration Guide](nemoretriever-ocr.md).
 
 - For advanced users who need direct filesystem access to extraction results, refer to [Ingestor Server Volume Mounting](mount-ingestor-volume.md).
 

@@ -86,6 +86,27 @@ def get_delete_docs_query(source_value: str):
     return query_delete_documents
 
 
+def get_chunks_by_source_and_pages_query(
+    source_name: str, page_numbers: list[int]
+) -> dict:
+    """
+    Build search query for retrieving chunks by source and page numbers.
+    Used for page context expansion (fetch_full_page_context).
+    """
+    return {
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"metadata.source.source_name.keyword": source_name}},
+                    {"terms": {"metadata.content_metadata.page_number": page_numbers}},
+                ]
+            }
+        },
+        "size": 1000,
+        "_source": ["text", "metadata"],
+    }
+
+
 def create_metadata_collection_mapping():
     """Generate Elasticsearch index mapping for metadata schema collections."""
     return {
@@ -179,6 +200,23 @@ def get_document_info_query(collection_name: str, document_name: str, info_type:
         }
     }
     return query_document_info
+
+
+def get_all_document_info_query(collection_name: str):
+    """
+    Create search query for retrieving all document info by collection name.
+    """
+    query_all_document_info = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"collection_name": collection_name}},
+                    {"term": {"info_type": "document"}},
+                ]
+            }
+        }
+    }
+    return query_all_document_info
 
 
 def get_delete_document_info_query_by_collection_name(collection_name: str):

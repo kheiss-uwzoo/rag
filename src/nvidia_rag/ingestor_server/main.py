@@ -29,18 +29,18 @@ Private methods:
 2. __run_background_ingest_task: Ingest documents to the vector store.
 3. __build_ingestion_response: Build the ingestion response from results and failures.
 4. __ingest_document_summary: Drives summary generation and ingestion if enabled.
-5. __put_content_to_minio: Put NV-Ingest image/table/chart content to MinIO.
-6. __perform_shallow_extraction_workflow: Perform shallow extraction workflow for fast summary generation.
-7. __run_nvingest_batched_ingestion: Upload documents to the vector store using NV-Ingest.
-8. __nv_ingest_ingestion_pipeline: Run the NV-Ingest ingestion pipeline.
-9. __get_failed_documents: Get failed documents from the vector store.
-10. __get_non_supported_files: Get non-supported files from the vector store.
+5. __perform_shallow_extraction_workflow: Perform shallow extraction workflow for fast summary generation.
+6. __run_nvingest_batched_ingestion: Upload documents to the vector store using NV-Ingest.
+7. __nv_ingest_ingestion_pipeline: Run the NV-Ingest ingestion pipeline (object storage is configured in nvingest).
+8. __get_failed_documents: Get failed documents from the vector store.
+9. __get_non_supported_files: Get non-supported files from the vector store.
 """
 
 import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -82,7 +82,6 @@ from nvidia_rag.utils.minio_operator import (
     get_minio_operator,
     get_unique_thumbnail_id_collection_prefix,
     get_unique_thumbnail_id_file_name_prefix,
-    get_unique_thumbnail_id_from_result,
 )
 from nvidia_rag.utils.observability.tracing import (
     create_nv_ingest_trace_context,
@@ -704,6 +703,25 @@ class NvidiaRAGIngestor:
                 e,
                 exc_info=logger.getEffectiveLevel() <= logging.DEBUG,
             )
+            # When ingestion fails, mark pending summaries as FAILED so that
+            # blocking GET /v1/summary callers get an error response immediately
+            # instead of waiting for the full timeout.
+            if generate_summary and collection_name:
+                for filepath in filepaths:
+                    file_name = os.path.basename(filepath)
+                    try:
+                        SUMMARY_STATUS_HANDLER.update_progress(
+                            collection_name=collection_name,
+                            file_name=file_name,
+                            status="FAILED",
+                            error=f"Ingestion failed: {str(e)}",
+                        )
+                    except Exception as status_err:
+                        logger.warning(
+                            "Failed to update summary status for %s: %s",
+                            file_name,
+                            status_err,
+                        )
             raise e
 
     @trace_function("ingestor.main.build_ingestion_response", tracer=TRACER)
@@ -895,6 +913,7 @@ class NvidiaRAGIngestor:
         if custom_metadata is None:
             custom_metadata = []
 
+        any_deleted = False
         for file in filepaths:
             file_name = os.path.basename(file)
 
@@ -925,6 +944,77 @@ class NvidiaRAGIngestor:
                     file_name,
                     collection_name,
                 )
+                any_deleted = True
+
+        # Compact only when rows were actually soft-deleted. Without compaction,
+        # Milvus's indexed_rows count remains inflated by the deleted rows, causing
+        # nvingest's wait_for_index to compute an expected count that can never be
+        # reached (expected = stale_count + new_rows, actual = live_rows + new_rows).
+        if any_deleted:
+            # Guard uploaded files against concurrent cleanup during compaction.
+            #
+            # compact_and_wait_async releases the asyncio event loop (via
+            # asyncio.to_thread) for up to 30 seconds. During that window a
+            # concurrent PATCH for the same file can finish its own background
+            # ingest task, whose cleanup deletes the shared upload path — leaving
+            # this task's file missing when upload_documents validates it.
+            #
+            # We snapshot each file to a hidden temp path on the same filesystem
+            # (no extra RAM, same mount so the copy is fast) right before compaction
+            # starts. At this point no await has been issued since delete_documents,
+            # so no concurrent cleanup could have run yet. The finally block
+            # guarantees the temp files are removed regardless of what happens next.
+            #
+            # (SERVER mode only: in LIBRARY mode the caller owns its files.)
+            file_temp_copies: dict[str, str] = {}
+            if self.mode == Mode.SERVER:
+                for filepath in filepaths:
+                    try:
+                        dir_path = os.path.dirname(filepath)
+                        name, ext = os.path.splitext(os.path.basename(filepath))
+                        temp_path = os.path.join(
+                            dir_path, f".{name}_{uuid4().hex}{ext}"
+                        )
+                        shutil.copy2(filepath, temp_path)
+                        file_temp_copies[filepath] = temp_path
+                    except OSError:
+                        pass
+
+            try:
+                vdb_op, resolved_collection_name = (
+                    self.__prepare_vdb_op_and_collection_name(
+                        vdb_endpoint=vdb_endpoint,
+                        collection_name=collection_name,
+                        vdb_auth_token=vdb_auth_token,
+                        bypass_validation=True,
+                    )
+                )
+                if hasattr(vdb_op, "compact_and_wait_async"):
+                    await vdb_op.compact_and_wait_async(resolved_collection_name)
+
+                # Restore any files deleted by a concurrent task's cleanup
+                # while compaction held the event loop.
+                for filepath, temp_path in file_temp_copies.items():
+                    if not os.path.exists(filepath):
+                        logger.debug(
+                            "Restoring %s after concurrent cleanup removed it during compaction",
+                            filepath,
+                        )
+                        try:
+                            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                            shutil.copy2(temp_path, filepath)
+                        except OSError as e:
+                            logger.warning(
+                                "Failed to restore %s from temp copy: %s", filepath, e
+                            )
+
+            finally:
+                # Always remove temp copies — success, exception, or cancellation.
+                for temp_path in file_temp_copies.values():
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
 
         response = await self.upload_documents(
             filepaths=filepaths,
@@ -1518,10 +1608,18 @@ class NvidiaRAGIngestor:
         vdb_endpoint: str | None = None,
         bypass_validation: bool = False,
         vdb_auth_token: str = "",
+        force_get_metadata: bool = False,
+        max_results: int | None = None,
     ) -> dict[str, Any]:
         """
         Retrieves filenames stored in the vector store.
         It's called when the GET endpoint of `/documents` API is invoked.
+
+        Args:
+            max_results: If set, cap ``documents`` to at most this many entries.
+                If ``None``, all matching documents are returned (no cap).
+                ``total_documents`` is always the full count in the collection,
+                not the length of the returned list.
 
         Returns:
             Dict[str, Any]: Response containing a list of documents with metadata.
@@ -1537,7 +1635,9 @@ class NvidiaRAGIngestor:
                 bypass_validation=bypass_validation,
                 vdb_auth_token=vdb_auth_token,
             )
-            documents_list = vdb_op.get_documents(collection_name)
+            documents_list = vdb_op.get_documents(
+                collection_name, force_get_metadata=force_get_metadata
+            )
 
             # Get metadata schema to filter out chunk-level auto-extracted fields
             metadata_schema = vdb_op.get_metadata_schema(collection_name)
@@ -1566,9 +1666,13 @@ class NvidiaRAGIngestor:
                 for doc_item in documents_list
             ]
 
+            total_documents = len(documents)
+            if max_results is not None:
+                documents = documents[: max(0, max_results)]
+
             return {
                 "documents": documents,
-                "total_documents": len(documents),
+                "total_documents": total_documents,
                 "message": "Document listing successfully completed.",
             }
 
@@ -1874,85 +1978,6 @@ class NvidiaRAGIngestor:
             "total_documents": 0,
             "documents": [],
         }
-
-    @trace_function("ingestor.main.put_content_to_minio", tracer=TRACER)
-    def __put_content_to_minio(
-        self,
-        results: list[list[dict[str, str | dict]]],
-        collection_name: str,
-    ) -> None:
-        """
-        Put nv-ingest image/table/chart content to minio
-        """
-        if not self.config.enable_citations:
-            logger.info(f"Skipping minio insertion for collection: {collection_name}")
-            return  # Don't perform minio insertion if captioning is disabled
-
-        payloads = []
-        object_names = []
-
-        for result in results:
-            for result_element in result:
-                if result_element.get("document_type") in ["image", "structured"]:
-                    # Extract required fields
-                    metadata = result_element.get("metadata", {})
-                    content = result_element.get("metadata").get("content")
-
-                    file_name = os.path.basename(
-                        result_element.get("metadata")
-                        .get("source_metadata")
-                        .get("source_id")
-                    )
-                    page_number = (
-                        result_element.get("metadata")
-                        .get("content_metadata")
-                        .get("page_number")
-                    )
-                    location = (
-                        result_element.get("metadata")
-                        .get("content_metadata")
-                        .get("location")
-                    )
-
-                    # Get unique_thumbnail_id using the centralized function
-                    # Try with extracted location first, fallback to content_metadata if None
-                    unique_thumbnail_id = get_unique_thumbnail_id_from_result(
-                        collection_name=collection_name,
-                        file_name=file_name,
-                        page_number=page_number,
-                        location=location,
-                        metadata=metadata,
-                    )
-
-                    if unique_thumbnail_id is not None:
-                        # Pull content from result_element
-                        payloads.append({"content": content})
-                        object_names.append(unique_thumbnail_id)
-                    # If unique_thumbnail_id is None, the item is skipped
-                    # (warning already logged in get_unique_thumbnail_id_from_result)
-
-        if self.minio_operator is not None:
-            if os.getenv("ENABLE_MINIO_BULK_UPLOAD", "True") in ["True", "true"]:
-                logger.info(f"Bulk uploading {len(payloads)} payloads to MinIO")
-                try:
-                    self.minio_operator.put_payloads_bulk(
-                        payloads=payloads, object_names=object_names
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to bulk upload to MinIO: {e}")
-            else:
-                logger.info(f"Sequentially uploading {len(payloads)} payloads to MinIO")
-                for payload, object_name in zip(payloads, object_names, strict=False):
-                    try:
-                        self.minio_operator.put_payload(
-                            payload=payload, object_name=object_name
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to upload {object_name} to MinIO: {e}")
-        else:
-            logger.warning(
-                f"MinIO unavailable - skipping upload of {len(payloads)} payloads"
-            )
 
     @trace_function("ingestor.main.process_shallow_batch", tracer=TRACER)
     async def __process_shallow_batch(
@@ -2351,7 +2376,7 @@ class NvidiaRAGIngestor:
         This methods performs following steps:
         - Perform extraction and splitting using NV-ingest ingestor (NV-Ingest)
         - Embeds and add documents to Vectorstore collection (NV-Ingest)
-        - Put content to MinIO (Ingestor Server)
+        - Persist structured content and images to object storage (NV-Ingest `.store()`, see nvingest)
         - Update batch progress with the ingestion response (Ingestor Server)
 
         Arguments:
@@ -2436,16 +2461,6 @@ class NvidiaRAGIngestor:
             raise Exception(error_message)
 
         try:
-            if self.mode != Mode.LITE:
-                start_time = time.time()
-                self.__put_content_to_minio(
-                    results=results, collection_name=collection_name
-                )
-                end_time = time.time()
-                logger.info(
-                    f"== MinIO upload for collection_name: {collection_name} "
-                    f"for batch {batch_number} is complete! Time taken: {end_time - start_time} seconds =="
-                )
             start_time = time.time()
             batch_progress_response = await self.__build_ingestion_response(
                 results=results,
@@ -2470,7 +2485,7 @@ class NvidiaRAGIngestor:
             )
         except Exception as e:
             logger.error(
-                "Failed to put content to minio: %s, citations would be disabled for collection: %s",
+                "Failed to build ingestion response or update batch progress: %s, collection: %s",
                 str(e),
                 collection_name,
                 exc_info=logger.getEffectiveLevel() <= logging.DEBUG,
@@ -2594,6 +2609,7 @@ class NvidiaRAGIngestor:
                 enable_pdf_split_processing=state_manager.enable_pdf_split_processing,
                 pdf_split_processing_options=state_manager.pdf_split_processing_options,
                 prompts=self.prompts,
+                store_images=self.mode != Mode.LITE,
             )
 
             start_time = time.time()
@@ -2673,6 +2689,7 @@ class NvidiaRAGIngestor:
                 enable_pdf_split_processing=state_manager.enable_pdf_split_processing,
                 pdf_split_processing_options=state_manager.pdf_split_processing_options,
                 prompts=self.prompts,
+                store_images=self.mode != Mode.LITE,
             )
             start_time = time.time()
             logger.info(
@@ -2720,6 +2737,7 @@ class NvidiaRAGIngestor:
                     enable_pdf_split_processing=state_manager.enable_pdf_split_processing,
                     pdf_split_processing_options=state_manager.pdf_split_processing_options,
                     prompts=self.prompts,
+                    store_images=self.mode != Mode.LITE,
                 )
                 start_time = time.time()
                 logger.info(
@@ -2761,6 +2779,7 @@ class NvidiaRAGIngestor:
                     enable_pdf_split_processing=state_manager.enable_pdf_split_processing,
                     pdf_split_processing_options=state_manager.pdf_split_processing_options,
                     prompts=self.prompts,
+                    store_images=self.mode != Mode.LITE,
                 )
                 start_time = time.time()
                 logger.info(

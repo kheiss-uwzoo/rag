@@ -29,17 +29,17 @@ The following table provides a comprehensive reference of all services, their po
 | Page Elements | `compose-page-elements-1` | 8000, 8001, 8002 | 8000, 8001, 8002 | 0 | `YOLOX_MS_GPU_ID` | Object detection for pages |
 | Graphic Elements | `compose-graphic-elements-1` | 8003, 8004, 8005 | 8000, 8001, 8002 | 0 | `YOLOX_GRAPHICS_MS_GPU_ID` | Graphics detection |
 | Table Structure | `compose-table-structure-1` | 8006, 8007, 8008 | 8000, 8001, 8002 | 0 | `YOLOX_TABLE_MS_GPU_ID` | Table structure detection |
-| NeMo Retriever Library OCR | `compose-nemoretriever-ocr-1` | 8012, 8013, 8014 | 8000, 8001, 8002 | 0 | `OCR_MS_GPU_ID` | OCR service (default) |
+| Nemotron OCR | `compose-nemotron-ocr-1` | 8012, 8013, 8014 | 8000, 8001, 8002 | 0 | `OCR_MS_GPU_ID` | OCR service (default) |
 
 ## Vector Database and Infrastructure
 
 | Service | Container Name | Host Port(s) | Container Port(s) | Default GPU ID | Environment Variable | Notes |
 |---------|---------------|--------------|-------------------|----------------|---------------------|-------|
-| Milvus | `milvus-standalone` | 19530, 9091 | 19530, 9091 | 0 | `VECTORSTORE_GPU_DEVICE_ID` | Vector database |
-| Milvus MinIO | `milvus-minio` | 9010, 9011 | 9010, 9011 | N/A (CPU) | N/A | Object storage |
-| Milvus etcd | `milvus-etcd` | N/A | 2379 | N/A (CPU) | N/A | Metadata storage |
+| Elasticsearch | `elasticsearch` | 9200 | 9200 | N/A (CPU) | N/A | Default |
 | Redis | `compose-redis-1` | 6379 | 6379 | N/A (CPU) | N/A | Task queue |
-| Elasticsearch | `elasticsearch` | 9200 | 9200 | N/A (CPU) | N/A | Profile: elasticsearch |
+| Milvus | `milvus-standalone` | 19530, 9091 | 19530, 9091 | 0 | `VECTORSTORE_GPU_DEVICE_ID` | Vector database (Profile: milvus) |
+| Milvus MinIO | `milvus-minio` | 9010, 9011 | 9010, 9011 | N/A (CPU) | N/A | Object storage (Profile: milvus) |
+| Milvus etcd | `milvus-etcd` | N/A | 2379 | N/A (CPU) | N/A | Metadata storage (Profile: milvus) |
 
 :::{note}
 **Opt-in NIM Services:**

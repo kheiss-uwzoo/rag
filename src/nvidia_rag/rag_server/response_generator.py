@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import time
+import base64
 from collections.abc import AsyncGenerator, Generator
 from typing import Any, Literal, Optional, Union
 from uuid import uuid4
@@ -38,10 +39,10 @@ from langchain_core.documents import Document
 from pydantic import BaseModel, Field, validator
 from pymilvus.exceptions import MilvusException, MilvusUnavailableException
 
+from nvidia_rag.utils.common import object_key_from_storage_uri
 from nvidia_rag.utils.minio_operator import (
     get_minio_operator,
     get_unique_thumbnail_id,
-    get_unique_thumbnail_id_from_result,
 )
 from nvidia_rag.utils.observability.otel_metrics import OtelMetrics
 
@@ -419,6 +420,7 @@ def generate_answer(
     retrieval_time_ms: float | None = None,
     rag_start_time_sec: float | None = None,
     otel_metrics_client: OtelMetrics | None = None,
+    token_usage: dict | None = None,
 ):
     """Generate and stream the response to the provided prompt.
 
@@ -429,6 +431,8 @@ def generate_answer(
         collection_name: Name of the collection used for retrieval
         enable_citations: Whether to enable citations in the response
         otel_metrics_client: Optional OpenTelemetry metrics client for updating latency histograms
+        token_usage: Optional mutable dict (e.g. {}) that a callback may populate with
+            prompt_tokens, completion_tokens, and total_tokens for the final chunk.
     """
 
     try:
@@ -537,6 +541,16 @@ def generate_answer(
             # Create response first, then attach metrics for clarity
             chain_response = ChainResponse()
             chain_response.metrics = final_metrics
+            if token_usage:
+                total = token_usage.get("total_tokens") or (
+                    token_usage.get("prompt_tokens", 0) + token_usage.get("completion_tokens", 0)
+                )
+                if total > 0:
+                    chain_response.usage = Usage(
+                        prompt_tokens=token_usage.get("prompt_tokens", 0),
+                        completion_tokens=token_usage.get("completion_tokens", 0),
+                        total_tokens=total,
+                    )
 
             # [DONE] indicate end of response from server
             response_choice = ChainResponseChoices(
@@ -585,6 +599,7 @@ async def generate_answer_async(
     retrieval_time_ms: float | None = None,
     rag_start_time_sec: float | None = None,
     otel_metrics_client: OtelMetrics | None = None,
+    token_usage: dict | None = None,
 ):
     """Generate and stream the response to the provided prompt asynchronously.
 
@@ -595,6 +610,8 @@ async def generate_answer_async(
         collection_name: Name of the collection used for retrieval
         enable_citations: Whether to enable citations in the response
         otel_metrics_client: Optional OpenTelemetry metrics client for updating latency histograms
+        token_usage: Optional mutable dict (e.g. {}) that a callback may populate with
+            prompt_tokens, completion_tokens, and total_tokens for the final chunk.
     """
 
     try:
@@ -703,6 +720,16 @@ async def generate_answer_async(
             # Create response first, then attach metrics for clarity
             chain_response = ChainResponse()
             chain_response.metrics = final_metrics
+            if token_usage:
+                total = token_usage.get("total_tokens") or (
+                    token_usage.get("prompt_tokens", 0) + token_usage.get("completion_tokens", 0)
+                )
+                if total > 0:
+                    chain_response.usage = Usage(
+                        prompt_tokens=token_usage.get("prompt_tokens", 0),
+                        completion_tokens=token_usage.get("completion_tokens", 0),
+                        total_tokens=total,
+                    )
 
             # [DONE] indicate end of response from server
             response_choice = ChainResponseChoices(
@@ -819,17 +846,15 @@ def prepare_citations(
                         logger.debug(
                             "Pulling content from minio for image/table/chart for citations ..."
                         )
-                        unique_thumbnail_id = get_unique_thumbnail_id_from_result(
-                            collection_name=doc.metadata.get("collection_name"),
-                            file_name=file_name,
-                            page_number=page_number,
-                            location=location,
-                            metadata=doc.metadata,
+                        source_location = doc.metadata.get("source").get(
+                            "source_location"
                         )
-                        payload = get_minio_operator_instance().get_payload(
-                            object_name=unique_thumbnail_id
-                        )
-                        content = payload.get("content", "")
+                        if source_location:
+                            object_name = object_key_from_storage_uri(source_location)
+                            raw_content = get_minio_operator_instance().get_object(object_name)
+                            content = base64.b64encode(raw_content).decode("ascii")
+                        else:
+                            content = ""
                         source_metadata = SourceMetadata(
                             page_number=page_number,
                             location=location,
@@ -843,7 +868,7 @@ def prepare_citations(
                             content_metadata=doc.metadata.get("content_metadata"),
                         )
                 except Exception as e:
-                    logger.error(
+                    logger.exception(
                         f"Error pulling content from minio for image/table/chart for citations: {e}"
                     )
                     content = ""
@@ -852,6 +877,8 @@ def prepare_citations(
                         content_metadata=doc.metadata.get("content_metadata", {}),
                     )
 
+            # If content is empty for image/text/table/chart/audio, skip adding to citations
+            # No content: asset is not available in MinIO, may cause an error in the UI client
             if content and document_type in [
                 "image",
                 "text",

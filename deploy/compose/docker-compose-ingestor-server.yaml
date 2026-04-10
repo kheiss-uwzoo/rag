@@ -30,10 +30,10 @@ services:
       ##===Vector DB specific configurations===
       # URL on which vectorstore is hosted
       # For custom operators, point to your service (e.g., http://your-custom-vdb:1234)
-      APP_VECTORSTORE_URL: ${APP_VECTORSTORE_URL:-http://milvus:19530}
+      APP_VECTORSTORE_URL: ${APP_VECTORSTORE_URL:-http://elasticsearch:9200}
       # Type of vectordb used to store embedding. Supported built-ins: "milvus", "elasticsearch".
       # You can also provide your custom value (e.g., "your_custom_vdb") when you register it in `_get_vdb_op`.
-      APP_VECTORSTORE_NAME: ${APP_VECTORSTORE_NAME:-"milvus"}
+      APP_VECTORSTORE_NAME: ${APP_VECTORSTORE_NAME:-"elasticsearch"}
       
       # Type of vectordb search to be used
       APP_VECTORSTORE_SEARCHTYPE: ${APP_VECTORSTORE_SEARCHTYPE:-"dense"} # Can be dense or hybrid
@@ -44,10 +44,10 @@ services:
       # Weight for sparse vector search in case of "weighted" Hybrid Search
       APP_VECTORSTORE_SPARSE_WEIGHT: ${APP_VECTORSTORE_SPARSE_WEIGHT:-0.5}
       
-      # Boolean to enable GPU index for milvus vectorstore specific to nvingest
-      APP_VECTORSTORE_ENABLEGPUINDEX: ${APP_VECTORSTORE_ENABLEGPUINDEX:-True}
-      # Boolean to control GPU search for milvus vectorstore specific to nvingest
-      APP_VECTORSTORE_ENABLEGPUSEARCH: ${APP_VECTORSTORE_ENABLEGPUSEARCH:-True}
+      # Milvus only (ignored for Elasticsearch). Set True when using Milvus + GPU.
+      APP_VECTORSTORE_ENABLEGPUINDEX: ${APP_VECTORSTORE_ENABLEGPUINDEX:-False}
+      # Milvus only (ignored for Elasticsearch). Set True when using Milvus + GPU.
+      APP_VECTORSTORE_ENABLEGPUSEARCH: ${APP_VECTORSTORE_ENABLEGPUSEARCH:-False}
       # Username for vector store
       APP_VECTORSTORE_USERNAME: ${APP_VECTORSTORE_USERNAME:-""}
       APP_VECTORSTORE_PASSWORD: ${APP_VECTORSTORE_PASSWORD:-""}
@@ -124,7 +124,7 @@ services:
       ENABLE_CITATIONS: ${ENABLE_CITATIONS:-True}
 
       # Choose the summary model to use for document summary
-      SUMMARY_LLM: ${SUMMARY_LLM:-nvidia/llama-3.3-nemotron-super-49b-v1.5}
+      SUMMARY_LLM: ${SUMMARY_LLM:-nvidia/nemotron-3-super-120b-a12b}
       SUMMARY_LLM_SERVERURL: ${SUMMARY_LLM_SERVERURL-${APP_LLM_SERVERURL-"nim-llm:8000"}}
       SUMMARY_LLM_MAX_CHUNK_LENGTH: ${SUMMARY_LLM_MAX_CHUNK_LENGTH:-9000}
       SUMMARY_CHUNK_OVERLAP: ${SUMMARY_CHUNK_OVERLAP:-400}
@@ -140,8 +140,6 @@ services:
       REDIS_DB: ${REDIS_DB:-0}
       ENABLE_REDIS_BACKEND: ${ENABLE_REDIS_BACKEND:-False}
 
-      # Bulk upload to MinIO
-      ENABLE_MINIO_BULK_UPLOAD: ${ENABLE_MINIO_BULK_UPLOAD:-True}
       TEMP_DIR: ${TEMP_DIR:-/tmp-data}
       INGESTOR_SERVER_DATA_DIR: ${INGESTOR_SERVER_DATA_DIR:-/data/}
 
@@ -149,6 +147,8 @@ services:
       NV_INGEST_FILES_PER_BATCH: ${NV_INGEST_FILES_PER_BATCH:-16}
       NV_INGEST_CONCURRENT_BATCHES: ${NV_INGEST_CONCURRENT_BATCHES:-4}
       ENABLE_NV_INGEST_DYNAMIC_BATCHING: ${ENABLE_NV_INGEST_DYNAMIC_BATCHING:-True}
+      # Max memory budget (MB) for a single ingestion job; used for dynamic batch sizing
+      INGESTION_MAX_MEMORY_BUDGET_MB: ${INGESTION_MAX_MEMORY_BUDGET_MB:-1024}
 
       # Tracing
       APP_TRACING_ENABLED: ${APP_TRACING_ENABLED:-"False"}
@@ -169,7 +169,7 @@ services:
       - "6379:6379"
 
   nv-ingest-ms-runtime:
-    image: nvcr.io/nvidia/nemo-microservices/nv-ingest:26.1.2
+    image: nvcr.io/nvidia/nemo-microservices/nv-ingest:26.3.0
     # cpuset: "0-15" # Uncomment to restrict this container to CPU cores 0–15
     shm_size: 40gb # Should be at minimum 30% of assigned memory per Ray documentation
     volumes:
@@ -220,12 +220,12 @@ services:
       - NV_INGEST_MAX_UTIL=${NV_INGEST_MAX_UTIL:-48}
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       # Self-hosted ocr endpoints.
-      - OCR_GRPC_ENDPOINT=${OCR_GRPC_ENDPOINT:-nemoretriever-ocr:8001}
-      - OCR_HTTP_ENDPOINT=${OCR_HTTP_ENDPOINT:-http://nemoretriever-ocr:8000/v1/infer}
+      - OCR_GRPC_ENDPOINT=${OCR_GRPC_ENDPOINT:-nemotron-ocr:8001}
+      - OCR_HTTP_ENDPOINT=${OCR_HTTP_ENDPOINT:-http://nemotron-ocr:8000/v1/infer}
       - OCR_INFER_PROTOCOL=${OCR_INFER_PROTOCOL:-grpc}
-      - OCR_MODEL_NAME=${OCR_MODEL_NAME:-scene_text_ensemble}
+      - OCR_MODEL_NAME=${OCR_MODEL_NAME:-pipeline}
       # build.nvidia.com hosted ocr endpoints.
-      #- OCR_HTTP_ENDPOINT=https://ai.api.nvidia.com/v1/cv/nvidia/nemoretriever-ocr
+      #- OCR_HTTP_ENDPOINT=https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v1
       #- OCR_INFER_PROTOCOL=http
       - PDF_SPLIT_PAGE_COUNT=${PDF_SPLIT_PAGE_COUNT:-32}
       - REDIS_INGEST_TASK_QUEUE=ingest_task_queue
