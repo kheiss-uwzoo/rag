@@ -15,6 +15,7 @@
 
 """Unit tests for elastic VDB functionality."""
 
+import logging
 import os
 import unittest
 from unittest.mock import ANY, MagicMock, Mock, call, patch
@@ -43,6 +44,26 @@ class TestElasticVDB(unittest.TestCase):
         self.meta_fields = ["field1"]
         self.embedding_model = "test_embedding_model"
         self.csv_file_path = "/path/to/test.csv"
+
+    def test_suppresses_elasticsearch_client_info_logs(self):
+        """Test Elasticsearch client request loggers are quiet by default."""
+        es_logger = logging.getLogger("elastic_transport")
+        original_level = es_logger.level
+
+        def restore_logger_levels() -> None:
+            es_logger.setLevel(original_level)
+
+        self.addCleanup(restore_logger_levels)
+        es_logger.setLevel(logging.NOTSET)
+
+        with patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch"):
+            with patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore"):
+                ElasticVDB(
+                    index_name=self.index_name,
+                    es_url=self.es_url,
+                )
+
+        self.assertEqual(es_logger.level, logging.WARNING)
 
     @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
     @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
@@ -1124,6 +1145,8 @@ class TestElasticVDB(unittest.TestCase):
         """API key should be preferred over basic auth when both are present."""
         mock_config = Mock()
         mock_config.embeddings.dimensions = 768
+        # Mock() is truthy; GPU path uses DenseVectorStrategyWithIndexOptions, not DenseVectorStrategy
+        mock_config.vector_store.enable_gpu_index = False
         mock_config.vector_store.search_type = "hybrid"
         mock_config.vector_store.api_key = SecretStr("base64-id-secret")
         mock_config.vector_store.api_key_id = None
@@ -1552,6 +1575,338 @@ class TestElasticVDB(unittest.TestCase):
         call_kwargs = mock_retriever.invoke.call_args[1]
         self.assertNotIn("custom_query", call_kwargs)
 
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    def test_retrieval_image_langchain_success(
+        self, mock_vector_store, mock_elasticsearch
+    ):
+        """Test retrieval_image_langchain returns page chunks for a matching image."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_es_connection = Mock()
+        mock_elasticsearch.return_value = mock_es_connection
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.return_value = [[0.1, 0.2, 0.3]]
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        # The top similarity-search result pointing to page 3 of doc.pdf
+        top_doc = Document(
+            page_content="image caption text",
+            metadata={
+                "source": {"source_name": "/data/doc.pdf"},
+                "content_metadata": {"page_number": 3, "type": "image"},
+            },
+        )
+        mock_vectorstore = Mock()
+        mock_vectorstore.similarity_search_by_vector_with_relevance_scores.return_value = [(top_doc, 0.9)]
+
+        # Chunks returned by the page-level filter query
+        page_chunk1 = Document(
+            page_content="chunk one",
+            metadata={
+                "source": {"source_name": "/data/doc.pdf"},
+                "content_metadata": {"page_number": 3},
+            },
+        )
+        page_chunk2 = Document(
+            page_content="chunk two",
+            metadata={
+                "source": {"source_name": "/data/doc.pdf"},
+                "content_metadata": {"page_number": 3},
+            },
+        )
+
+        # Simulate what retrieve_chunks_by_filter returns (already has collection_name)
+        def _fake_retrieve_chunks(collection_name, source_name, page_numbers, limit):
+            page_chunk1.metadata["collection_name"] = collection_name
+            page_chunk2.metadata["collection_name"] = collection_name
+            return [page_chunk1, page_chunk2]
+
+        elastic_vdb.retrieve_chunks_by_filter = _fake_retrieve_chunks
+
+        result = elastic_vdb.retrieval_image_langchain(
+            query="data:image/jpeg;base64,AAAA",
+            collection_name="test_collection",
+            vectorstore=mock_vectorstore,
+            top_k=5,
+        )
+
+        # Embedding called with the image query
+        mock_embedding_model.embed_documents.assert_called_once_with(
+            ["data:image/jpeg;base64,AAAA"]
+        )
+        # Similarity search called with the embedding and top_k
+        mock_vectorstore.similarity_search_by_vector_with_relevance_scores.assert_called_once_with(
+            embedding=[0.1, 0.2, 0.3], k=5
+        )
+        # Two chunks returned
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].page_content, "chunk one")
+        self.assertEqual(result[1].page_content, "chunk two")
+        # collection_name propagated
+        for doc in result:
+            self.assertEqual(doc.metadata["collection_name"], "test_collection")
+
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    def test_retrieval_image_langchain_uses_reranker_top_k_as_limit(
+        self, mock_vector_store, mock_elasticsearch
+    ):
+        """retrieval_image_langchain passes reranker_top_k as limit to retrieve_chunks_by_filter."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_elasticsearch.return_value = Mock()
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.return_value = [[0.5]]
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        top_doc = Document(
+            page_content="img",
+            metadata={
+                "source": {"source_name": "file.pdf"},
+                "content_metadata": {"page_number": 1},
+            },
+        )
+        mock_vectorstore = Mock()
+        mock_vectorstore.similarity_search_by_vector_with_relevance_scores.return_value = [(top_doc, 0.9)]
+
+        captured = {}
+
+        def _fake_retrieve(collection_name, source_name, page_numbers, limit):
+            captured["limit"] = limit
+            return []
+
+        elastic_vdb.retrieve_chunks_by_filter = _fake_retrieve
+
+        elastic_vdb.retrieval_image_langchain(
+            query="img_data",
+            collection_name="col",
+            vectorstore=mock_vectorstore,
+            top_k=10,
+            reranker_top_k=3,
+        )
+
+        # reranker_top_k=3 must be used as the limit, not top_k=10
+        self.assertEqual(captured["limit"], 3)
+
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    def test_retrieval_image_langchain_uses_top_k_when_no_reranker_top_k(
+        self, mock_vector_store, mock_elasticsearch
+    ):
+        """retrieval_image_langchain falls back to top_k when reranker_top_k is None."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_elasticsearch.return_value = Mock()
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.return_value = [[0.5]]
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        top_doc = Document(
+            page_content="img",
+            metadata={
+                "source": {"source_name": "file.pdf"},
+                "content_metadata": {"page_number": 2},
+            },
+        )
+        mock_vectorstore = Mock()
+        mock_vectorstore.similarity_search_by_vector_with_relevance_scores.return_value = [(top_doc, 0.9)]
+
+        captured = {}
+
+        def _fake_retrieve(collection_name, source_name, page_numbers, limit):
+            captured["limit"] = limit
+            return []
+
+        elastic_vdb.retrieve_chunks_by_filter = _fake_retrieve
+
+        elastic_vdb.retrieval_image_langchain(
+            query="img_data",
+            collection_name="col",
+            vectorstore=mock_vectorstore,
+            top_k=7,
+            # reranker_top_k defaults to None
+        )
+
+        # Should fall back to top_k=7
+        self.assertEqual(captured["limit"], 7)
+
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.logger")
+    def test_retrieval_image_langchain_empty_similarity_results(
+        self, mock_logger, mock_vector_store, mock_elasticsearch
+    ):
+        """retrieval_image_langchain returns [] when similarity search finds nothing."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_elasticsearch.return_value = Mock()
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.return_value = [[0.1]]
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        mock_vectorstore = Mock()
+        mock_vectorstore.similarity_search_by_vector_with_relevance_scores.return_value = []  # nothing found
+
+        result = elastic_vdb.retrieval_image_langchain(
+            query="img_data",
+            collection_name="col",
+            vectorstore=mock_vectorstore,
+            top_k=5,
+        )
+
+        self.assertEqual(result, [])
+
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.logger")
+    def test_retrieval_image_langchain_embedding_error_returns_empty(
+        self, mock_logger, mock_vector_store, mock_elasticsearch
+    ):
+        """retrieval_image_langchain returns [] and logs on embedding failure."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_elasticsearch.return_value = Mock()
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.side_effect = RuntimeError("embed failed")
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        mock_vectorstore = Mock()
+
+        result = elastic_vdb.retrieval_image_langchain(
+            query="bad_img",
+            collection_name="col",
+            vectorstore=mock_vectorstore,
+        )
+
+        self.assertEqual(result, [])
+        mock_logger.error.assert_called_once()
+        error_msg = mock_logger.error.call_args[0][0]
+        self.assertIn("Error generating embeddings", error_msg)
+
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.logger")
+    def test_retrieval_image_langchain_missing_metadata_returns_empty(
+        self, mock_logger, mock_vector_store, mock_elasticsearch
+    ):
+        """retrieval_image_langchain returns [] and logs when metadata keys are absent."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_elasticsearch.return_value = Mock()
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.return_value = [[0.1]]
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        # Doc with incomplete metadata — missing source_name
+        bad_doc = Document(
+            page_content="bad",
+            metadata={"source": {}, "content_metadata": {}},
+        )
+        mock_vectorstore = Mock()
+        mock_vectorstore.similarity_search_by_vector_with_relevance_scores.return_value = [(bad_doc, 0.9)]
+
+        result = elastic_vdb.retrieval_image_langchain(
+            query="img",
+            collection_name="col",
+            vectorstore=mock_vectorstore,
+        )
+
+        self.assertEqual(result, [])
+        mock_logger.error.assert_called_once()
+        error_msg = mock_logger.error.call_args[0][0]
+        self.assertIn("Error accessing metadata", error_msg)
+
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.Elasticsearch")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.VectorStore")
+    @patch("nvidia_rag.utils.vdb.elasticsearch.elastic_vdb.ElasticsearchStore")
+    def test_retrieval_image_langchain_creates_vectorstore_when_none(
+        self, mock_es_store_class, mock_vector_store, mock_elasticsearch
+    ):
+        """retrieval_image_langchain calls get_langchain_vectorstore when none provided."""
+        mock_config = Mock()
+        mock_config.embeddings.dimensions = 768
+        mock_config.vector_store.search_type = "dense"
+
+        mock_elasticsearch.return_value = Mock()
+
+        mock_embedding_model = Mock()
+        mock_embedding_model.embed_documents.return_value = [[0.1]]
+
+        elastic_vdb = ElasticVDB(
+            self.index_name,
+            self.es_url,
+            embedding_model=mock_embedding_model,
+            config=mock_config,
+        )
+
+        mock_vs_instance = Mock()
+        mock_vs_instance.similarity_search_by_vector_with_relevance_scores.return_value = []
+        mock_es_store_class.return_value = mock_vs_instance
+
+        elastic_vdb.retrieval_image_langchain(
+            query="img",
+            collection_name="col",
+            # vectorstore=None (default) — should trigger get_langchain_vectorstore
+        )
+
+        # ElasticsearchStore must have been constructed (via get_langchain_vectorstore)
+        mock_es_store_class.assert_called_once()
+
 
 class TestEsQueries(unittest.TestCase):
     """Test cases for es_queries module functions."""
@@ -1572,7 +1927,7 @@ class TestEsQueries(unittest.TestCase):
 
         # Verify composite aggregation
         composite = unique_sources["composite"]
-        self.assertEqual(composite["size"], 1000)
+        self.assertEqual(composite["size"], 65536)
         self.assertIn("sources", composite)
 
         # Verify source field configuration
@@ -1597,8 +1952,8 @@ class TestEsQueries(unittest.TestCase):
 
         # Verify term query
         term_query = result["query"]["term"]
-        self.assertIn("collection_name.keyword", term_query)
-        self.assertEqual(term_query["collection_name.keyword"], collection_name)
+        self.assertIn("collection_name", term_query)
+        self.assertEqual(term_query["collection_name"], collection_name)
 
     def test_get_metadata_schema_query(self):
         """Test get_metadata_schema_query function with collection name."""
@@ -1660,7 +2015,7 @@ class TestEsQueries(unittest.TestCase):
         # Should still return valid structure with empty string
         self.assertIn("query", result)
         term_query = result["query"]["term"]
-        self.assertEqual(term_query["collection_name.keyword"], "")
+        self.assertEqual(term_query["collection_name"], "")
 
     def test_get_metadata_schema_query_special_characters(self):
         """Test get_metadata_schema_query with special characters in collection name."""

@@ -196,7 +196,7 @@ services:
   # Main ingestor server which is responsible for ingestion
   ingestor-server:
     container_name: ingestor-server
-    image: nvcr.io/nvidia/blueprint/ingestor-server:${TAG:-2.5.0}
+    image: nvcr.io/nvstaging/blueprint/ingestor-server:${TAG:-2.6.0.rc1}
     build:
       # Set context to repo's root directory
       context: ../../
@@ -229,9 +229,9 @@ services:
       APP_VECTORSTORE_DENSE_WEIGHT: ${APP_VECTORSTORE_DENSE_WEIGHT:-0.5}
       # Weight for sparse vector search in case of "weighted" Hybrid Search
       APP_VECTORSTORE_SPARSE_WEIGHT: ${APP_VECTORSTORE_SPARSE_WEIGHT:-0.5}
-      # Boolean to enable GPU index (Milvus only; ignored for Elasticsearch)
+      # Enable GPU index building. Applies to both Milvus and Elasticsearch (requires GPU-capable image and license for ES).
       APP_VECTORSTORE_ENABLEGPUINDEX: ${APP_VECTORSTORE_ENABLEGPUINDEX:-False}
-      # Boolean to control GPU search (Milvus only; ignored for Elasticsearch)
+      # Enable GPU search. Milvus only — GPU search is not supported by Elasticsearch.
       APP_VECTORSTORE_ENABLEGPUSEARCH: ${APP_VECTORSTORE_ENABLEGPUSEARCH:-False}
       # ef: Parameter controlling query time/accuracy trade-off. Higher ef leads to more accurate but slower search.
       APP_VECTORSTORE_EF: ${APP_VECTORSTORE_EF:-100}
@@ -242,10 +242,10 @@ services:
       # vectorstore collection name to store embeddings
       COLLECTION_NAME: ${COLLECTION_NAME:-multimodal_data}
 
-      ##===MINIO specific configurations===
-      MINIO_ENDPOINT: "minio:9010"
-      MINIO_ACCESSKEY: "minioadmin"
-      MINIO_SECRETKEY: "minioadmin"
+      ##===Object-store specific configurations===
+      OBJECTSTORE_ENDPOINT: ${OBJECTSTORE_ENDPOINT:-seaweedfs:9010}
+      OBJECTSTORE_ACCESSKEY: ${OBJECTSTORE_ACCESSKEY:-seaweedfsadmin}
+      OBJECTSTORE_SECRETKEY: ${OBJECTSTORE_SECRETKEY:-seaweedfsadmin}
 
       NGC_API_KEY: ${NGC_API_KEY:?"NGC_API_KEY is required"}
       NVIDIA_API_KEY: ${NGC_API_KEY:?"NGC_API_KEY is required"}
@@ -273,7 +273,7 @@ services:
       ##===NV-Ingest Splitting Configurations========
       APP_NVINGEST_CHUNKSIZE: ${APP_NVINGEST_CHUNKSIZE:-512}
       APP_NVINGEST_CHUNKOVERLAP: ${APP_NVINGEST_CHUNKOVERLAP:-150}
-      APP_NVINGEST_ENABLEPDFSPLITTER: ${APP_NVINGEST_ENABLEPDFSPLITTER:-True}
+      APP_NVINGEST_ENABLE_PAGED_DOC_SPLIT: ${APP_NVINGEST_ENABLE_PAGED_DOC_SPLIT:-False}
       APP_NVINGEST_SEGMENTAUDIO: ${APP_NVINGEST_SEGMENTAUDIO:-False} # Enable audio segmentation for NV Ingest
 
       ##===NV-Ingest Caption Model configurations====
@@ -283,7 +283,7 @@ services:
 
       ##===NV-Ingest Save to Disk Configurations====
       APP_NVINGEST_SAVETODISK: ${APP_NVINGEST_SAVETODISK:-False}
-      NVINGEST_MINIO_BUCKET: ${NVINGEST_MINIO_BUCKET:-nv-ingest}
+      NVINGEST_OBJECTSTORE_BUCKET: ${NVINGEST_OBJECTSTORE_BUCKET:-nv-ingest}
 
       ##===NV-Ingest Performance Configurations========
       APP_NVINGEST_ENABLE_PDF_SPLIT_PROCESSING: ${APP_NVINGEST_ENABLE_PDF_SPLIT_PROCESSING:-False}
@@ -369,9 +369,9 @@ services:
       - MESSAGE_CLIENT_HOST=redis
       - MESSAGE_CLIENT_PORT=6379
       - MESSAGE_CLIENT_TYPE=redis
-      - MINIO_BUCKET=${MINIO_BUCKET:-nv-ingest}
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_BUCKET=${NVINGEST_OBJECTSTORE_BUCKET:-nv-ingest}
+      - MINIO_ACCESS_KEY=${OBJECTSTORE_ACCESSKEY:-seaweedfsadmin}
+      - MINIO_SECRET_KEY=${OBJECTSTORE_SECRETKEY:-seaweedfsadmin}
       - MRC_IGNORE_NUMA_CHECK=1
       - NEMOTRON_PARSE_HTTP_ENDPOINT=${NEMOTRON_PARSE_HTTP_ENDPOINT:-http://nemotron-parse:8000/v1/chat/completions}
       - NEMOTRON_PARSE_INFER_PROTOCOL=${NEMOTRON_PARSE_INFER_PROTOCOL:-http}
@@ -428,7 +428,7 @@ services:
   # Main orchestrator server which stiches together all calls to different services to fulfill the user request
   rag-server:
     container_name: rag-server
-    image: nvcr.io/nvidia/blueprint/rag-server:${TAG:-2.5.0}
+    image: nvcr.io/nvstaging/blueprint/rag-server:${TAG:-2.6.0.rc1}
     build:
       # Set context to repo's root directory
       context: ../../
@@ -446,10 +446,10 @@ services:
       # Absolute path to custom prompt.yaml file
       PROMPT_CONFIG_FILE: ${PROMPT_CONFIG_FILE:-/prompt.yaml}
 
-      ##===MINIO specific configurations which is used to store the multimodal base64 content===
-      MINIO_ENDPOINT: "minio:9010"
-      MINIO_ACCESSKEY: "minioadmin"
-      MINIO_SECRETKEY: "minioadmin"
+      ##===Object-store specific configurations which is used to store the multimodal base64 content===
+      OBJECTSTORE_ENDPOINT: ${OBJECTSTORE_ENDPOINT:-seaweedfs:9010}
+      OBJECTSTORE_ACCESSKEY: ${OBJECTSTORE_ACCESSKEY:-seaweedfsadmin}
+      OBJECTSTORE_SECRETKEY: ${OBJECTSTORE_SECRETKEY:-seaweedfsadmin}
 
       ##===Vector DB specific configurations===
       # URL on which vectorstore is hosted (Milvus: http://milvus:19530 when using --profile vectordb)
@@ -555,6 +555,40 @@ services:
       # reflection llm server url. If "", Nvidia hosted API is used
       REFLECTION_LLM_SERVERURL: ${REFLECTION_LLM_SERVERURL-"nim-llm:8000"}
 
+      # === Agentic RAG (LangGraph plan-and-execute pipeline) ===
+      ENABLE_AGENTIC_RAG: ${ENABLE_AGENTIC_RAG:-false}
+
+      ##===Agentic Planner LLM configurations===
+      AGENTIC_PLANNER_LLM_SERVERURL: ${AGENTIC_PLANNER_LLM_SERVERURL-"nim-llm:8000"}
+      AGENTIC_PLANNER_LLM_MODEL: ${AGENTIC_PLANNER_LLM_MODEL:-"nvidia/nemotron-3-super-120b-a12b"}
+
+      ##===Agentic Task LLM configurations===
+      AGENTIC_TASK_LLM_SERVERURL: ${AGENTIC_TASK_LLM_SERVERURL-"nim-llm:8000"}
+      AGENTIC_TASK_LLM_MODEL: ${AGENTIC_TASK_LLM_MODEL:-"nvidia/nemotron-3-super-120b-a12b"}
+
+      ##===Agentic Seed Gen LLM configurations===
+      AGENTIC_SEED_GEN_LLM_SERVERURL: ${AGENTIC_SEED_GEN_LLM_SERVERURL-"nim-llm:8000"}
+      AGENTIC_SEED_GEN_LLM_MODEL: ${AGENTIC_SEED_GEN_LLM_MODEL:-"nvidia/nemotron-3-super-120b-a12b"}
+
+      ##===Agentic Synthesis LLM configurations===
+      AGENTIC_SYNTHESIS_LLM_SERVERURL: ${AGENTIC_SYNTHESIS_LLM_SERVERURL-"nim-llm:8000"}
+      AGENTIC_SYNTHESIS_LLM_MODEL: ${AGENTIC_SYNTHESIS_LLM_MODEL:-"nvidia/nemotron-3-super-120b-a12b"}
+
+      # Per-role agentic API keys (optional; empty uses NVIDIA_API_KEY fallback)
+      AGENTIC_PLANNER_LLM_APIKEY: ${AGENTIC_PLANNER_LLM_APIKEY:-""}
+      AGENTIC_TASK_LLM_APIKEY: ${AGENTIC_TASK_LLM_APIKEY:-""}
+      AGENTIC_SEED_GEN_LLM_APIKEY: ${AGENTIC_SEED_GEN_LLM_APIKEY:-""}
+      AGENTIC_SYNTHESIS_LLM_APIKEY: ${AGENTIC_SYNTHESIS_LLM_APIKEY:-""}
+
+      # Agent behaviour tuning
+      AGENTIC_LOG_LEVEL: ${AGENTIC_LOG_LEVEL:-INFO}
+
+      # Verification pass (disabled by default)
+      AGENTIC_VERIFICATION_ENABLED: ${AGENTIC_VERIFICATION_ENABLED:-false}
+
+      # Context window budget for retrieved chunks
+      AGENTIC_CONTEXT_MAX_TOKENS: ${AGENTIC_CONTEXT_MAX_TOKENS:-100000}
+
     ports:
       - "8081:8081"
     expose:
@@ -565,7 +599,7 @@ services:
   # Sample UI container which interacts with APIs exposed by rag-server container
   rag-frontend:
     container_name: rag-frontend
-    image: nvcr.io/nvidia/blueprint/rag-frontend:${TAG:-2.5.0}
+    image: nvcr.io/nvstaging/blueprint/rag-frontend:${TAG:-2.6.0.rc1}
     build:
       # Set context to repo's root directory
       context: ../../frontend
@@ -593,10 +627,15 @@ services:
   milvus:
     container_name: milvus-standalone
     image: milvusdb/milvus:v2.5.3-gpu # milvusdb/milvus:v2.5.3 for CPU
-    command: ["milvus", "run", "standalone"]
+    command: >
+      bash -lc 'tmpfile=$(mktemp) &&
+      sed -e "s/bucketName: a-bucket/bucketName: ${NVINGEST_OBJECTSTORE_BUCKET:-nv-ingest}/" -e "s/accessKeyID: minioadmin/accessKeyID: ${OBJECTSTORE_ACCESSKEY:-seaweedfsadmin}/" -e "s/secretAccessKey: minioadmin/secretAccessKey: ${OBJECTSTORE_SECRETKEY:-seaweedfsadmin}/" /milvus/configs/milvus.yaml > "$$tmpfile" &&
+      cat "$$tmpfile" > /milvus/configs/milvus.yaml &&
+      rm "$$tmpfile" &&
+      milvus run standalone'
     environment:
       ETCD_ENDPOINTS: etcd:2379
-      MINIO_ADDRESS: minio:9010
+      MINIO_ADDRESS: seaweedfs:9010
       KNOWHERE_GPU_MEM_POOL_SIZE: 2048;4096
     volumes:
       - ${DOCKER_VOLUME_DIRECTORY:-./volumes/milvus}:/var/lib/milvus
@@ -611,7 +650,7 @@ services:
       - "9091:9091"
     depends_on:
       - "etcd"
-      - "minio"
+      - "seaweedfs"
     # Comment out this section if CPU based image is used and set below env variables to False
     # export APP_VECTORSTORE_ENABLEGPUSEARCH=False
     # export APP_VECTORSTORE_ENABLEGPUINDEX=False
@@ -643,29 +682,36 @@ services:
       retries: 3
     profiles: ["vectordb"]
 
-  minio:
-    container_name: milvus-minio
-    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+  seaweedfs:
+    container_name: seaweedfs
+    image: chrislusf/seaweedfs:3.73
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${OBJECTSTORE_ACCESSKEY:-seaweedfsadmin}
+      MINIO_SECRET_KEY: ${OBJECTSTORE_SECRETKEY:-seaweedfsadmin}
     ports:
       - "9011:9011"
       - "9010:9010"
     volumes:
-      - ${DOCKER_VOLUME_DIRECTORY:-./volumes/minio}:/minio_data
-    command: minio server /minio_data --console-address ":9011" --address ":9010"
+      - ${DOCKER_VOLUME_DIRECTORY:-./volumes/seaweedfs}:/data
+      - ../compose/seaweedfs-config/s3.json:/etc/seaweedfs/s3.json:ro
+    command:
+      - server
+      - -dir=/data
+      - -s3
+      - -s3.port=9010
+      - -s3.config=/etc/seaweedfs/s3.json
+      - -master.volumeSizeLimitMB=1024
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9010/minio/health/live"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9010"]
       interval: 30s
       timeout: 20s
       retries: 3
     # Shared object storage for NV-Ingest and Milvus; included with ingest/rag so ES deployments do not require --profile vectordb
-    profiles: ["vectordb", "ingest", "rag"]
+    profiles: ["vectordb", "ingest", "rag", "seaweedfs"]
 
   elasticsearch:
     container_name: elasticsearch
-    image: "docker.elastic.co/elasticsearch/elasticsearch:9.0.3"
+    image: "docker.elastic.co/elasticsearch/elasticsearch:9.3.0"
     ports:
       - "9200:9200"
     volumes:

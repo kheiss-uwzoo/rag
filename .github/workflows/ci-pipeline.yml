@@ -83,16 +83,29 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          apt-get update && apt-get install -y gcc && rm -rf /var/lib/apt/lists/*
+          apt-get update && apt-get install -y gcc curl && rm -rf /var/lib/apt/lists/*
 
       - name: Install package with dependencies
         run: |
-          pip install -e .[all]
-          pip install --no-cache-dir -r tests/unit/requirements-test.txt
+          # Install uv (Python package and environment manager)
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Create a fresh virtual environment using uv
+          rm -rf venv-unit || echo "No existing venv-unit to clean up"
+          uv venv venv-unit
+          . venv-unit/bin/activate
+          uv pip install -e .[all]
+          uv pip install --no-cache -r tests/unit/requirements-test.txt
+          # rag-perf is a separate package under scripts/rag-perf/. Install its
+          # runtime deps into the same venv so tests/unit/test_rag_perf/ can
+          # import rag_perf.config (which pulls ruamel.yaml, click, pydantic).
+          uv pip install -e ./scripts/rag-perf
 
       - name: Run unit tests with coverage
         run: |
-          python -m pytest -v -s --cov=src --cov-report=term-missing tests/unit
+          . venv-unit/bin/activate
+          python -m pytest -v -s --cov=src --cov-report=term-missing tests/unit --ignore=tests/unit/test_ingestor_server/test_nemo_retriever --ignore=tests/unit/test_utils/test_vdb/test_lancedb_vdb.py
 
   frontend-unit-tests:
     name: Frontend Unit Tests
@@ -172,9 +185,11 @@ jobs:
     runs-on: arc-runners-org-nvidia-ai-bp-2-gpu
     # Only run if push to develop OR PR from same repo (not fork) - needs secrets
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.pull_request.head.repo.full_name == github.repository
-    # Multimodal query sequence requires Milvus; default CI VDB is Elasticsearch (see docs/multimodal-query.md).
+    # Multimodal query sequence uses NVIDIA API catalog cloud endpoints; works with Elasticsearch VDB.
     env:
-      ENABLE_MULTIMODAL_QUERY_CI: "false"
+      ENABLE_MULTIMODAL_QUERY_CI: "true"
+      # NeMo Retriever Library (NRL) + LanceDB integration sequences (set to "true" to run in CI).
+      ENABLE_NRL_INTEGRATION_TESTS: "false"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -305,7 +320,7 @@ jobs:
         run: |
           echo "=== LOGS FOR RUNNING CONTAINERS ==="
           docker logs --tail 50 elasticsearch || echo "No logs for elasticsearch"
-          docker logs --tail 50 milvus-minio || echo "No logs for milvus-minio"
+          docker logs --tail 50 seaweedfs || echo "No logs for seaweedfs"
           docker logs rag-server || echo "No logs for rag-server"
           docker logs ingestor-server || echo "No logs for ingestor-server"
           echo "Deploy stage completed successfully"
@@ -409,7 +424,7 @@ jobs:
           mkdir -p logs/milvus-sequence
           docker logs milvus-standalone > logs/milvus-sequence/milvus.log 2>&1 || true
           docker logs milvus-etcd > logs/milvus-sequence/etcd.log 2>&1 || true
-          docker logs milvus-minio > logs/milvus-sequence/minio.log 2>&1 || true
+          docker logs seaweedfs > logs/milvus-sequence/seaweedfs.log 2>&1 || true
           docker logs rag-server > logs/milvus-sequence/rag-server.log 2>&1 || true
           docker logs ingestor-server > logs/milvus-sequence/ingestor-server.log 2>&1 || true
           docker logs compose-nv-ingest-ms-runtime-1 > logs/milvus-sequence/nvingest.log 2>&1 || true
@@ -694,7 +709,7 @@ jobs:
           cp tests/integration/integration_test.log logs/vlm-generation/ 2>/dev/null || true
 
       # ========================================================================
-      # MULTIMODAL QUERY TESTS (skipped while CI uses Elasticsearch; set ENABLE_MULTIMODAL_QUERY_CI=true to run)
+      # MULTIMODAL QUERY TESTS
       # ========================================================================
 
       - name: Prepare multimodal test data
@@ -808,7 +823,7 @@ jobs:
       - name: Stop rag-server and ingestor-server for library tests
         run: |
           echo "Stopping rag-server and ingestor-server containers (library mode doesn't need them)..."
-          echo "Keeping nv-ingest-ms-runtime, Elasticsearch, Redis, MinIO running for library mode..."
+          echo "Keeping nv-ingest-ms-runtime, Elasticsearch, Redis, object store running for library mode..."
           docker stop rag-server || true
           docker stop ingestor-server || true
           echo "Services stopped. Library tests will use the nvidia_rag library directly."
@@ -986,7 +1001,7 @@ jobs:
           echo "Checking Milvus logs..."
           docker logs --tail 100 milvus-standalone || true
           docker logs --tail 50 milvus-etcd || true
-          docker logs --tail 50 milvus-minio || true
+          docker logs --tail 50 seaweedfs || true
       
       - name: Restart services for Milvus VDB auth tests
         env:
@@ -1027,7 +1042,7 @@ jobs:
           docker logs ingestor-server > logs/milvus-vdb-auth/ingestor-server.log 2>&1 || true
           docker logs milvus-standalone > logs/milvus-vdb-auth/milvus.log 2>&1 || true
           docker logs milvus-etcd > logs/milvus-vdb-auth/etcd.log 2>&1 || true
-          docker logs milvus-minio > logs/milvus-vdb-auth/minio.log 2>&1 || true
+          docker logs seaweedfs > logs/milvus-vdb-auth/seaweedfs.log 2>&1 || true
           cp tests/integration/integration_test.log logs/milvus-vdb-auth/ 2>/dev/null || true
       
       - name: Revert Milvus VDB auth configurations
@@ -1048,7 +1063,7 @@ jobs:
           sed -i 's|- \${MILVUS_CONFIG_FILE:-./milvus.yaml}:/milvus/configs/milvus.yaml|# - ${MILVUS_CONFIG_FILE:-./milvus.yaml}:/milvus/configs/milvus.yaml|' tests/integration/vectordb.yaml
           sed -i 's|# - \${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus|- \${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus|' tests/integration/vectordb.yaml
           
-          # Restart default vector DB stack (Elasticsearch + MinIO) for end of job
+          # Restart default vector DB stack (Elasticsearch + object store) for end of job
           echo "Restarting vector database stack after Milvus auth tests..."
           docker compose -f tests/integration/vectordb.yaml up -d
           sleep 30
@@ -1061,6 +1076,155 @@ jobs:
           echo "APP_VECTORSTORE_PASSWORD=" >> $GITHUB_ENV
           echo "VDB_AUTH_TOKEN=" >> $GITHUB_ENV
           echo "MILVUS_ROOT_TOKEN=" >> $GITHUB_ENV
+
+      # ========================================================================
+      # NEMO RETRIEVER LIBRARY (NRL) + LANCEDB TESTS
+      # ========================================================================
+      # NeMo-Retriever Library runs in-process; LanceDB URI is the mounted path inside containers.
+      # Gated by ENABLE_NRL_INTEGRATION_TESTS (job env above).
+
+      - name: Prepare LanceDB volume directory
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        run: |
+          mkdir -p volumes/lancedb
+          # Clear prior DB only (APP_VECTORSTORE_URL=/volumes/lancedb/lancedb); keep .gitkeep
+          rm -rf volumes/lancedb/lancedb 2>/dev/null || true
+          ls -la volumes/lancedb
+
+      - name: Configure environment for NeMo Retriever Library (NRL) sequence tests
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        run: |
+          echo "APP_VECTORSTORE_URL=/volumes/lancedb/lancedb" >> $GITHUB_ENV
+          echo "APP_VECTORSTORE_NAME=lancedb" >> $GITHUB_ENV
+          echo "INGESTOR_BACKEND=nrl" >> $GITHUB_ENV
+          # Reset ingestor + shared compose env after prior suites (vs docker-compose-ingestor-server.yaml + nvdev.env).
+          echo "APP_NVINGEST_EXTRACTIMAGES=False" >> $GITHUB_ENV
+          echo "APP_NVINGEST_STRUCTURED_ELEMENTS_MODALITY=" >> $GITHUB_ENV
+          echo "APP_NVINGEST_IMAGE_ELEMENTS_MODALITY=" >> $GITHUB_ENV
+          echo "APP_EMBEDDINGS_MODELNAME=nvidia/llama-nemotron-embed-1b-v2" >> $GITHUB_ENV
+          echo "APP_EMBEDDINGS_SERVERURL=https://integrate.api.nvidia.com/v1" >> $GITHUB_ENV
+          echo "APP_TRACING_ENABLED=False" >> $GITHUB_ENV
+          # RAG compose (same job env for docker compose): restore nvdev / defaults after multimodal
+          echo "ENABLE_VLM_INFERENCE=False" >> $GITHUB_ENV
+          echo "ENABLE_RERANKER=True" >> $GITHUB_ENV
+          echo "APP_RANKING_SERVERURL=" >> $GITHUB_ENV
+          echo "MILVUS_CONFIG_FILE=" >> $GITHUB_ENV
+
+      - name: Restart services for NRL + LanceDB sequence tests
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        env:
+          CI_NVSTAGING_BLUEPRINT_KEY: ${{ secrets.CI_NVSTAGING_BLUEPRINT_KEY }}
+        run: |
+          echo "Relaunching RAG and ingestor with LanceDB + NRL..."
+          export APP_VECTORSTORE_URL=/volumes/lancedb/lancedb
+          export APP_VECTORSTORE_NAME=lancedb
+          export INGESTOR_BACKEND=nrl
+          export APP_EMBEDDINGS_MODELNAME=nvidia/llama-nemotron-embed-1b-v2
+          export APP_EMBEDDINGS_SERVERURL=https://integrate.api.nvidia.com/v1
+          export APP_NVINGEST_EXTRACTIMAGES=False
+          export APP_NVINGEST_IMAGE_ELEMENTS_MODALITY=
+          export APP_TRACING_ENABLED=False
+          docker compose -f deploy/compose/docker-compose-rag-server.yaml down || true
+          docker compose -f deploy/compose/docker-compose-ingestor-server.yaml down || true
+          sleep 5
+          docker compose -f deploy/compose/docker-compose-rag-server.yaml up -d --build
+          docker compose -f deploy/compose/docker-compose-ingestor-server.yaml up -d --build
+          sleep 30
+          docker ps
+
+      - name: Run NeMo Retriever Library integration tests
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        id: nemo-retriever-library-tests
+        continue-on-error: true
+        run: |
+          source venv/bin/activate
+          echo "Running NeMo Retriever Library integration tests (sequence nemo_retriever_library)..."
+          python -m tests.integration.main --sequence nemo_retriever_library
+          echo "NeMo Retriever Library integration tests completed"
+
+      - name: Collect logs after NeMo Retriever Library tests
+        if: ${{ always() && env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        run: |
+          mkdir -p logs/nemo-retriever-library
+          docker logs rag-server > logs/nemo-retriever-library/rag-server.log 2>&1 || true
+          docker logs ingestor-server > logs/nemo-retriever-library/ingestor-server.log 2>&1 || true
+          docker logs compose-nv-ingest-ms-runtime-1 > logs/nemo-retriever-library/nvingest.log 2>&1 || true
+          cp tests/integration/integration_test.log logs/nemo-retriever-library/ 2>/dev/null || true
+
+      # ------------------------------------------------------------------------
+      # NRL + LanceDB: VLM generation (same API tests as vlm_generation)
+      # ------------------------------------------------------------------------
+      - name: Configure environment for NeMo Retriever Library VLM generation tests
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        run: |
+          echo "ENABLE_VLM_INFERENCE=True" >> $GITHUB_ENV
+          echo "APP_NVINGEST_EXTRACTIMAGES=False" >> $GITHUB_ENV
+          echo "ENABLE_QUERYREWRITER=False" >> $GITHUB_ENV
+          echo "CONVERSATION_HISTORY=0" >> $GITHUB_ENV
+
+      - name: Restart services for NeMo Retriever Library VLM generation tests
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        env:
+          CI_NVSTAGING_BLUEPRINT_KEY: ${{ secrets.CI_NVSTAGING_BLUEPRINT_KEY }}
+        run: |
+          echo "Relaunching RAG and ingestor with LanceDB + NRL + VLM generation..."
+          export APP_VECTORSTORE_URL=/volumes/lancedb/lancedb
+          export APP_VECTORSTORE_NAME=lancedb
+          export INGESTOR_BACKEND=nrl
+          export APP_EMBEDDINGS_MODELNAME=nvidia/llama-nemotron-embed-1b-v2
+          export APP_EMBEDDINGS_SERVERURL=https://integrate.api.nvidia.com/v1
+          export APP_NVINGEST_EXTRACTIMAGES=False
+          export APP_NVINGEST_IMAGE_ELEMENTS_MODALITY=
+          export APP_TRACING_ENABLED=False
+          export ENABLE_VLM_INFERENCE=True
+          export ENABLE_RERANKER=True
+          export APP_RANKING_SERVERURL=
+          docker compose -f deploy/compose/docker-compose-rag-server.yaml down || true
+          docker compose -f deploy/compose/docker-compose-ingestor-server.yaml down || true
+          sleep 5
+          docker compose -f deploy/compose/docker-compose-rag-server.yaml up -d --build
+          docker compose -f deploy/compose/docker-compose-ingestor-server.yaml up -d --build
+          sleep 30
+          docker ps
+
+      - name: Run NeMo Retriever Library VLM generation integration tests
+        if: ${{ env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        id: nemo-retriever-library-vlm-generation-tests
+        continue-on-error: true
+        run: |
+          source venv/bin/activate
+          echo "Running NeMo Retriever Library VLM generation integration tests (sequence nemo_retriever_library_vlm_generation)..."
+          python -m tests.integration.main --sequence nemo_retriever_library_vlm_generation
+          echo "NeMo Retriever Library VLM generation integration tests completed"
+
+      - name: Collect logs after NeMo Retriever Library VLM generation tests
+        if: ${{ always() && env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        run: |
+          mkdir -p logs/nemo-retriever-library-vlm-generation
+          docker logs rag-server > logs/nemo-retriever-library-vlm-generation/rag-server.log 2>&1 || true
+          docker logs ingestor-server > logs/nemo-retriever-library-vlm-generation/ingestor-server.log 2>&1 || true
+          docker logs compose-nv-ingest-ms-runtime-1 > logs/nemo-retriever-library-vlm-generation/nvingest.log 2>&1 || true
+          cp tests/integration/integration_test.log logs/nemo-retriever-library-vlm-generation/ 2>/dev/null || true
+
+      - name: Restore default vector store and ingestor backend after NRL tests
+        if: ${{ always() && env.ENABLE_NRL_INTEGRATION_TESTS == 'true' }}
+        env:
+          CI_NVSTAGING_BLUEPRINT_KEY: ${{ secrets.CI_NVSTAGING_BLUEPRINT_KEY }}
+        run: |
+          echo "Restoring Elasticsearch + nv_ingest for workflow cleanup consistency..."
+          echo "APP_VECTORSTORE_URL=http://elasticsearch:9200" >> $GITHUB_ENV
+          echo "APP_VECTORSTORE_NAME=elasticsearch" >> $GITHUB_ENV
+          echo "INGESTOR_BACKEND=nv_ingest" >> $GITHUB_ENV
+          export APP_VECTORSTORE_URL=http://elasticsearch:9200
+          export APP_VECTORSTORE_NAME=elasticsearch
+          export INGESTOR_BACKEND=nv_ingest
+          docker compose -f deploy/compose/docker-compose-rag-server.yaml down || true
+          docker compose -f deploy/compose/docker-compose-ingestor-server.yaml down || true
+          sleep 5
+          docker compose -f deploy/compose/docker-compose-rag-server.yaml up -d --build
+          docker compose -f deploy/compose/docker-compose-ingestor-server.yaml up -d --build
+          sleep 30
+          docker ps
       
       # ========================================================================
       # FAIL JOB IF ANY INTEGRATION TEST FAILED
@@ -1068,7 +1232,7 @@ jobs:
       # All test steps use continue-on-error so every suite runs; this step
       # marks the job as failed if any of them failed.
       - name: Fail job if any integration test failed
-        if: always() && (steps.basic-tests.outcome == 'failure' || steps.milvus-sequence-tests.outcome == 'failure' || steps.query-rewriter-tests.outcome == 'failure' || steps.reflection-tests.outcome == 'failure' || steps.guardrails-tests.outcome == 'failure' || steps.image-captioning-tests.outcome == 'failure' || steps.vlm-generation-tests.outcome == 'failure' || steps.multimodal-query-tests.outcome == 'failure' || steps.custom-prompt-tests.outcome == 'failure' || steps.library-usage-tests.outcome == 'failure' || steps.library-summarization-tests.outcome == 'failure' || steps.observability-tests.outcome == 'failure' || steps.milvus-vdb-auth-tests.outcome == 'failure')
+        if: always() && (steps.basic-tests.outcome == 'failure' || steps.milvus-sequence-tests.outcome == 'failure' || steps.query-rewriter-tests.outcome == 'failure' || steps.reflection-tests.outcome == 'failure' || steps.guardrails-tests.outcome == 'failure' || steps.image-captioning-tests.outcome == 'failure' || steps.vlm-generation-tests.outcome == 'failure' || steps.multimodal-query-tests.outcome == 'failure' || steps.custom-prompt-tests.outcome == 'failure' || steps.library-usage-tests.outcome == 'failure' || steps.library-summarization-tests.outcome == 'failure' || steps.observability-tests.outcome == 'failure' || steps.milvus-vdb-auth-tests.outcome == 'failure' || steps.nemo-retriever-library-tests.outcome == 'failure' || steps.nemo-retriever-library-vlm-generation-tests.outcome == 'failure')
         run: |
           echo "=== Failed integration test suites ==="
           [ "${{ steps.basic-tests.outcome }}" = "failure" ] && echo "  - basic-tests"
@@ -1084,6 +1248,8 @@ jobs:
           [ "${{ steps.library-summarization-tests.outcome }}" = "failure" ] && echo "  - library-summarization-tests"
           [ "${{ steps.observability-tests.outcome }}" = "failure" ] && echo "  - observability-tests"
           [ "${{ steps.milvus-vdb-auth-tests.outcome }}" = "failure" ] && echo "  - milvus-vdb-auth-tests"
+          [ "${{ steps.nemo-retriever-library-tests.outcome }}" = "failure" ] && echo "  - nemo-retriever-library-tests"
+          [ "${{ steps.nemo-retriever-library-vlm-generation-tests.outcome }}" = "failure" ] && echo "  - nemo-retriever-library-vlm-generation-tests"
           echo "One or more integration test suites failed. Failing job."
           exit 1
 

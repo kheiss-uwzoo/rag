@@ -90,7 +90,7 @@ When you install the Helm chart, enable only the following services that are req
 - `text-reranking-nim`
 - `nim-llm`
 - `milvus`
-- `minio`
+- `seaweedfs`
 
 Additionally, ensure that **table extraction**, **chart extraction**, and **image extraction** are disabled.
 
@@ -113,7 +113,7 @@ Additionally, ensure that **table extraction**, **chart extraction**, and **imag
 2. Then use the modified [`values.yaml`](../deploy/helm/nvidia-blueprint-rag/values.yaml) file in your Helm upgrade command:
 
 ```bash
-helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/charts/nvidia-blueprint-rag-v2.5.0.tgz \
+helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvstaging/blueprint/charts/nvidia-blueprint-rag-v2.6.0-rc1.tgz \
   --username '$oauthtoken' \
   --password "${NGC_API_KEY}" \
   --values deploy/helm/nvidia-blueprint-rag/values.yaml \

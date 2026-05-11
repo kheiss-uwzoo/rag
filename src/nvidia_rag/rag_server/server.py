@@ -385,20 +385,22 @@ class Prompt(BaseModel):
     use_knowledge_base: bool = Field(
         default=True, description="Whether to use a knowledge base"
     )
-    temperature: float = Field(
+    temperature: float | None = Field(
         default_temperature,
         description="The sampling temperature to use for text generation. "
         "The higher the temperature value is, the less deterministic the output text will be. "
+        "If unset, the model/provider default is used. "
         "It is not recommended to modify both temperature and top_p in the same call.",
         ge=0.0,
         le=1.0,
     )
-    top_p: float = Field(
+    top_p: float | None = Field(
         default_top_p,
         description="The top-p sampling mass used for text generation. "
         "The top-p value determines the probability mass that is sampled at sampling time. "
         "For example, if top_p = 0.2, only the most likely tokens "
-        "(summing to 0.2 cumulative probability) will be sampled. "
+        "(summing to 0.2 cumulative probability) will be sampled. If unset, "
+        "the model/provider default is used. "
         "It is not recommended to modify both temperature and top_p in the same call.",
         ge=0.1,
         le=1.0,
@@ -552,6 +554,37 @@ class Prompt(BaseModel):
         le=64,
         format="int64",
     )
+    vlm_enable_thinking: bool | None = Field(
+        default=None,
+        description=(
+            "Enable VLM chain-of-thought reasoning for this request. "
+            "When omitted, falls back to the server-side default "
+            "(APP_VLM_ENABLE_THINKING). Independent of the LLM-side "
+            "thinking knobs (min_thinking_tokens / max_thinking_tokens)."
+        ),
+    )
+    vlm_thinking_token_budget: int | None = Field(
+        default=None,
+        description=(
+            "Maximum tokens the VLM may spend on reasoning (0 = unbounded). "
+            "Only applied when vlm_enable_thinking is True. When omitted, "
+            "falls back to the server-side default (APP_VLM_THINKING_TOKEN_BUDGET)."
+        ),
+        ge=0,
+        le=65536,
+        format="int64",
+    )
+    vlm_filter_thinking_tokens: bool | None = Field(
+        default=None,
+        description=(
+            "When True the VLM's reasoning trace is suppressed and only the "
+            "final answer is streamed. When False the reasoning trace is "
+            "streamed first, wrapped in [reasoning]...[/reasoning] sentinels, "
+            "followed by the answer. When omitted, falls back to the "
+            "server-side default (VLM_FILTER_THINK_TOKENS). No-op if "
+            "vlm_enable_thinking is False (nothing to filter)."
+        ),
+    )
 
     # seed: int = Field(42, description="If specified, our system will make a best effort to sample deterministically,
     #       such that repeated requests with the same seed and parameters should return the same result.")
@@ -590,6 +623,24 @@ class Prompt(BaseModel):
         description="N pages before/after each retrieved page (0=disabled, 1=+/-1 page).",
         ge=0,
         le=10,
+    )
+    agentic: bool | None = Field(
+        default=CONFIG.enable_agentic_rag,
+        description=(
+            "Route this request through the agentic RAG pipeline (LangGraph plan-and-execute). "
+            "When None (default), the server-level CONFIG.enable_agentic_rag config value is used. "
+            "Explicitly passing True or False overrides the server default for this request."
+        ),
+    )
+    enable_streaming: bool = Field(
+        default=True,
+        description=(
+            "Stream intermediate reasoning, stage announcements, and final-answer tokens as "
+            "they are produced. Currently honored by the agentic RAG pipeline; the regular "
+            "(non-agentic) pipeline always streams. When False on the agentic path, the graph "
+            "runs to completion and the full answer is returned as a single SSE chunk "
+            "(legacy behavior)."
+        ),
     )
 
     @model_validator(mode="after")
@@ -810,10 +861,10 @@ class SummaryResponse(BaseModel):
 class RagConfigurationDefaults(BaseModel):
     """Default values for RAG configuration parameters."""
 
-    temperature: float = Field(
+    temperature: float | None = Field(
         description="Default sampling temperature for generation"
     )
-    top_p: float = Field(description="Default top-p sampling mass")
+    top_p: float | None = Field(description="Default top-p sampling mass")
     max_tokens: int = Field(description="Default maximum tokens to generate")
     vdb_top_k: int = Field(
         description="Default number of documents to retrieve from vector DB"
@@ -1407,9 +1458,13 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
         "vlm_temperature": prompt.vlm_temperature,
         "vlm_top_p": prompt.vlm_top_p,
         "vlm_max_tokens": prompt.vlm_max_tokens,
+        "vlm_enable_thinking": prompt.vlm_enable_thinking,
+        "vlm_thinking_token_budget": prompt.vlm_thinking_token_budget,
+        "vlm_filter_thinking_tokens": prompt.vlm_filter_thinking_tokens,
         "vlm_max_total_images": prompt.vlm_max_total_images,
         "filter_expr": prompt.filter_expr,
         "confidence_threshold": prompt.confidence_threshold,
+        "agentic": prompt.agentic,
     }
     logger.info(
         f"📥 Incoming request to /generate endpoint:\n{json.dumps(request_data, indent=2)}"
@@ -1489,11 +1544,16 @@ async def generate_answer(request: Request, prompt: Prompt) -> StreamingResponse
             vlm_temperature=prompt.vlm_temperature,
             vlm_top_p=prompt.vlm_top_p,
             vlm_max_tokens=prompt.vlm_max_tokens,
+            vlm_enable_thinking=prompt.vlm_enable_thinking,
+            vlm_thinking_token_budget=prompt.vlm_thinking_token_budget,
+            vlm_filter_thinking_tokens=prompt.vlm_filter_thinking_tokens,
             vlm_max_total_images=prompt.vlm_max_total_images,
             filter_expr=prompt.filter_expr,
             confidence_threshold=prompt.confidence_threshold,
             fetch_full_page_context=prompt.fetch_full_page_context,
             fetch_neighboring_pages=prompt.fetch_neighboring_pages,
+            agentic=prompt.agentic,
+            enable_streaming=prompt.enable_streaming,
             rag_start_time_sec=generate_start_time,
             metrics=metrics,
         )

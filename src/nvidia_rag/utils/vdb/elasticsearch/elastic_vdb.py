@@ -48,8 +48,9 @@ Document Info Management:
 
 Retrieval Operations:
 19. retrieval_langchain: Perform semantic search and return top-k relevant documents
-20. _get_langchain_vectorstore: Get the vectorstore for a collection
-21. _add_collection_name_to_retreived_docs: Add the collection name to the retrieved documents
+20. retrieval_image_langchain: Perform image-based (multimodal) search and return top-k relevant documents
+21. _get_langchain_vectorstore: Get the vectorstore for a collection
+22. _add_collection_name_to_retreived_docs: Add the collection name to the retrieved documents
 """
 
 import logging
@@ -95,6 +96,9 @@ from nvidia_rag.utils.vdb.elasticsearch.es_queries import (
     get_weighted_hybrid_custom_query,
     get_all_document_info_query,
 )
+from nvidia_rag.utils.vdb.elasticsearch.es_dense_vector_strategy import (
+    DenseVectorStrategyWithIndexOptions,
+)
 from nvidia_rag.utils.vdb.vdb_ingest_base import VDBRagIngest
 
 logger = logging.getLogger(__name__)
@@ -119,6 +123,8 @@ class ElasticVDB(VDBRagIngest):
         config: NvidiaRAGConfig | None = None,
         auth_token: str | None = None,
     ):
+        logging.getLogger("elastic_transport").setLevel(logging.WARNING)
+
         self.config = config or NvidiaRAGConfig()
         self.index_name = index_name
         self.es_url = es_url
@@ -204,6 +210,8 @@ class ElasticVDB(VDBRagIngest):
             hybrid=self.hybrid,
         )
 
+        self._repair_stale_ingest_refresh_settings()
+
     @property
     def collection_name(self) -> str:
         """Get the collection name."""
@@ -213,6 +221,13 @@ class ElasticVDB(VDBRagIngest):
     def collection_name(self, collection_name: str) -> None:
         """Set the collection name."""
         self.index_name = collection_name
+
+    def _get_retrieval_strategy(self, hybrid: bool = False) -> DenseVectorStrategy:
+        """Return the appropriate retrieval strategy based on GPU config."""
+        if self.config.vector_store.enable_gpu_index:
+            logger.debug("Elasticsearch GPU indexing enabled: using DenseVectorStrategyWithIndexOptions")
+            return DenseVectorStrategyWithIndexOptions(hybrid=hybrid)
+        return DenseVectorStrategy(hybrid=hybrid)
 
     def _get_es_store(
         self,
@@ -227,7 +242,7 @@ class ElasticVDB(VDBRagIngest):
             num_dimensions=dimensions,
             text_field="text",
             vector_field="vector",
-            retrieval_strategy=DenseVectorStrategy(hybrid=hybrid),
+            retrieval_strategy=self._get_retrieval_strategy(hybrid=hybrid),
         )
 
     # ----------------------------------------------------------------------------------------------
@@ -237,6 +252,42 @@ class ElasticVDB(VDBRagIngest):
         Check if the index exists in Elasticsearch.
         """
         return self._es_connection.indices.exists(index=index_name)
+
+    def _repair_stale_ingest_refresh_settings(self) -> None:
+        """
+        If a prior bulk ingest exited before restoring settings, refresh_interval may
+        remain -1. Reset to 1s so search visibility and cluster behavior are normal.
+        """
+        if not self.index_name or not self._check_index_exists(self.index_name):
+            return
+        try:
+            resp = self._es_connection.indices.get_settings(index=self.index_name)
+        except (ESConnectionError, ConnectionError, OSError) as e:
+            logger.warning(
+                "Could not read settings for Elasticsearch index %s: %s",
+                self.index_name,
+                e,
+            )
+            return
+        index_block = resp.get(self.index_name)
+        if index_block is None and resp:
+            index_block = next(iter(resp.values()))
+        if not index_block:
+            return
+        settings = index_block.get("settings", {})
+        index_settings = settings.get("index", {})
+        refresh = index_settings.get("refresh_interval")
+        if refresh in ("-1", "-1s"):
+            logger.warning(
+                "Index %s has refresh_interval=%s (stale after interrupted ingest); "
+                "resetting to 1s",
+                self.index_name,
+                refresh,
+            )
+            self._es_connection.indices.put_settings(
+                index=self.index_name,
+                body={"index": {"refresh_interval": "1s"}},
+            )
 
     def create_index(self):
         """
@@ -293,35 +344,45 @@ class ElasticVDB(VDBRagIngest):
             f"Commencing Elasticsearch ingestion process for {total_records} records..."
         )
 
-        # Process records in batches of batch_size
-        for i in range(0, total_records, batch_size):
-            end_idx = min(i + batch_size, total_records)
-            batch_texts = texts[i:end_idx]
-            batch_embeddings = embeddings[i:end_idx]
-            batch_metadatas = metadatas[i:end_idx]
+        self._es_connection.indices.put_settings(
+            index=self.index_name,
+            body={"index": {"refresh_interval": "-1"}},
+        )
+        try:
+            # Process records in batches of batch_size
+            for i in range(0, total_records, batch_size):
+                end_idx = min(i + batch_size, total_records)
+                batch_texts = texts[i:end_idx]
+                batch_embeddings = embeddings[i:end_idx]
+                batch_metadatas = metadatas[i:end_idx]
 
-            # Upload current batch to Elasticsearch
-            self.es_store.add_texts(
-                texts=batch_texts,
-                vectors=batch_embeddings,
-                metadatas=batch_metadatas,
-            )
-
-            uploaded_count += len(batch_texts)
-
-            # Log progress every 5 batches (5000 records)
-            if (
-                uploaded_count % (5 * batch_size) == 0
-                or uploaded_count == total_records
-            ):
-                logger.info(
-                    f"Successfully ingested {uploaded_count} records into Elasticsearch index {self.index_name}"
+                # Upload current batch to Elasticsearch
+                self.es_store.add_texts(
+                    texts=batch_texts,
+                    vectors=batch_embeddings,
+                    metadatas=batch_metadatas,
                 )
+
+                uploaded_count += len(batch_texts)
+
+                # Log progress every 5 batches (5000 records)
+                if (
+                    uploaded_count % (5 * batch_size) == 0
+                    or uploaded_count == total_records
+                ):
+                    logger.info(
+                        f"Successfully ingested {uploaded_count} records into Elasticsearch index {self.index_name}"
+                    )
+        finally:
+            self._es_connection.indices.put_settings(
+                index=self.index_name,
+                body={"index": {"refresh_interval": "1s"}},
+            )
+            self._es_connection.indices.refresh(index=self.index_name)
 
         logger.info(
             f"Elasticsearch ingestion completed. Total records processed: {uploaded_count}"
         )
-        self._es_connection.indices.refresh(index=self.index_name)
 
     def retrieval(self, queries: list, **kwargs) -> list[dict[str, Any]]:
         """
@@ -549,11 +610,11 @@ class ElasticVDB(VDBRagIngest):
         response = self._es_connection.search(
             index=collection_name, body=get_unique_sources_query()
         )
-        
+
         # Get all document info for the collection
         all_document_info = self._get_all_document_info(collection_name)
         all_document_info_map = {doc["document_name"]: doc["info_value"] for doc in all_document_info}
-        
+
         # Get the list of documents
         documents_list = []
         for hit in response["aggregations"]["unique_sources"]["buckets"]:
@@ -691,7 +752,7 @@ class ElasticVDB(VDBRagIngest):
             index=DEFAULT_METADATA_SCHEMA_COLLECTION, body=query
         )
         if len(response["hits"]["hits"]) > 0:
-            return response["hits"]["hits"][0]["_source"]["metadata_schema"]
+            return response["hits"]["hits"][-1]["_source"]["metadata_schema"]
         else:
             logging_message = (
                 f"No metadata schema found for the collection: {collection_name}."
@@ -787,7 +848,7 @@ class ElasticVDB(VDBRagIngest):
             "info_value": info_value,
         }
         self._es_connection.index(index=DEFAULT_DOCUMENT_INFO_COLLECTION, body=data)
-        logger.info(
+        logger.debug(
             f"Document info added to the ES index {DEFAULT_DOCUMENT_INFO_COLLECTION}. \
             Document info: {info_type}, {document_name}, {info_value}."
         )
@@ -814,10 +875,10 @@ class ElasticVDB(VDBRagIngest):
         except Exception as e:
             logger.error(f"Error getting document info for {info_type}, {collection_name}, {document_name}: {e}")
             return {}
-    
+
     def _get_all_document_info(self, collection_name: str) -> list[dict[str, Any]]:
         """Get all document info for a collection.
-        
+
         Returns:
             list[dict[str, Any]]: List of document info for the collection. (hit["_source"])
         """
@@ -1032,6 +1093,67 @@ class ElasticVDB(VDBRagIngest):
 
         return self._add_collection_name_to_retreived_docs(docs, collection_name)
 
+    def retrieval_image_langchain(
+        self,
+        query: str,
+        collection_name: str,
+        vectorstore: ElasticsearchStore | None = None,
+        top_k: int = 10,
+        reranker_top_k: int | None = None,
+    ) -> list[Document]:
+        """Retrieve documents from a collection using an image query.
+
+        Embeds the image query via the configured embedding model, performs a
+        vector similarity search to find the most relevant document page, then
+        returns all chunks from that page for multimodal context.
+
+        Args:
+            query: The image query (base64 encoded)
+            collection_name: Name of the collection to search
+            vectorstore: Optional pre-initialized ElasticsearchStore
+            top_k: Number of results for initial similarity search (VDB top_k)
+            reranker_top_k: Final number of documents to return. If None,
+                           defaults to top_k.
+
+        Note: Uses the embedding_model provided during initialization.
+        """
+        final_limit = reranker_top_k if reranker_top_k is not None else top_k
+
+        if vectorstore is None:
+            vectorstore = self.get_langchain_vectorstore(collection_name)
+
+        try:
+            embedding = self._embedding_model.embed_documents([query])
+            scored = vectorstore.similarity_search_by_vector_with_relevance_scores(
+                embedding=embedding[0],
+                k=top_k,
+            )
+            results = [doc for doc, _ in scored]
+        except Exception as e:
+            logger.error(
+                "Error generating embeddings or performing similarity search: %s", e,
+                exc_info=True,
+            )
+            return []
+
+        if not results:
+            return []
+
+        try:
+            metadata = results[0].metadata
+            source_name = metadata["source"]["source_name"]
+            page_number = metadata["content_metadata"]["page_number"]
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error("Error accessing metadata from search results: %s", e)
+            return []
+
+        return self.retrieve_chunks_by_filter(
+            collection_name=collection_name,
+            source_name=source_name,
+            page_numbers=[page_number],
+            limit=final_limit,
+        )
+
     def get_langchain_vectorstore(
         self,
         collection_name: str,
@@ -1044,7 +1166,7 @@ class ElasticVDB(VDBRagIngest):
             "index_name": collection_name,
             "es_url": self.es_url,
             "embedding": self._embedding_model,
-            "strategy": DenseVectorStrategy(
+            "strategy": self._get_retrieval_strategy(
                 hybrid=self.config.vector_store.search_type == SearchType.HYBRID
             ),
         }

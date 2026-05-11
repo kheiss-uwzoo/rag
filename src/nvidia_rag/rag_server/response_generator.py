@@ -18,18 +18,19 @@
 2. prepare_llm_request(): Prepare the request for the LLM response generation.
 3. generate_answer(): Generate and stream the response to the provided prompt (sync).
 4. generate_answer_async(): Generate and stream the response to the provided prompt (async).
-5. prepare_citations(): Prepare citations for the response.
-6. error_response_generator(): Generate a stream of data for the error response (sync).
-7. error_response_generator_async(): Generate a stream of data for the error response (async).
-8. retrieve_summary(): Retrieve the summary of a document.
+5. prepare_citations(): Prepare citations for nv-ingest backed responses.
+6. prepare_citations_nrl(): Prepare citations for NRL (LanceDB) backed responses.
+7. error_response_generator(): Generate a stream of data for the error response (sync).
+8. error_response_generator_async(): Generate a stream of data for the error response (async).
+9. retrieve_summary(): Retrieve the summary of a document.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import time
-import base64
 from collections.abc import AsyncGenerator, Generator
 from typing import Any, Literal, Optional, Union
 from uuid import uuid4
@@ -39,9 +40,9 @@ from langchain_core.documents import Document
 from pydantic import BaseModel, Field, validator
 from pymilvus.exceptions import MilvusException, MilvusUnavailableException
 
-from nvidia_rag.utils.common import object_key_from_storage_uri
-from nvidia_rag.utils.minio_operator import (
-    get_minio_operator,
+from nvidia_rag.utils.configuration import NvidiaRAGConfig
+from nvidia_rag.utils.object_store import (
+    get_object_store_operator,
     get_unique_thumbnail_id,
 )
 from nvidia_rag.utils.observability.otel_metrics import OtelMetrics
@@ -92,15 +93,25 @@ FALLBACK_EXCEPTION_MSG = (
     "Error from rag-server. Please check rag-server logs for more details."
 )
 
-MINIO_OPERATOR = None
+OBJECT_STORE_OPERATOR = None
+OBJECT_STORE_CONFIG: NvidiaRAGConfig | None = None
 
 
-def get_minio_operator_instance():
-    """Lazy initialize the MinioOperator instance"""
-    global MINIO_OPERATOR
-    if MINIO_OPERATOR is None:
-        MINIO_OPERATOR = get_minio_operator()
-    return MINIO_OPERATOR
+def configure_object_store_operator(config: NvidiaRAGConfig | None) -> None:
+    """Reset the cached object-store operator to use the provided config."""
+    global OBJECT_STORE_OPERATOR, OBJECT_STORE_CONFIG
+    OBJECT_STORE_CONFIG = config
+    OBJECT_STORE_OPERATOR = None
+
+
+def get_object_store_operator_instance(config: NvidiaRAGConfig | None = None):
+    """Lazy initialize the object-store operator instance."""
+    global OBJECT_STORE_OPERATOR, OBJECT_STORE_CONFIG
+    if config is not None:
+        OBJECT_STORE_CONFIG = config
+    if OBJECT_STORE_OPERATOR is None:
+        OBJECT_STORE_OPERATOR = get_object_store_operator(config=OBJECT_STORE_CONFIG)
+    return OBJECT_STORE_OPERATOR
 
 
 class Usage(BaseModel):
@@ -212,6 +223,12 @@ class SourceResult(BaseModel):
         default="text", description="Type of document content"
     )
     score: float = Field(default=0.0, description="Relevance score of the document")
+    stage: str = Field(
+        default="rag",
+        max_length=100,
+        pattern=r"[\s\S]*",
+        description="Pipeline stage that produced this result (e.g. 'rag', 'initial_retrieval', 'execute', 'verify_execute')",
+    )
 
     metadata: SourceMetadata
 
@@ -252,7 +269,7 @@ class TextContent(BaseModel):
 
     type: Literal["text"] = Field(default="text", description="The type of content")
     text: str = Field(
-        description="The text content", max_length=131072, pattern=r"[\s\S]*"
+        description="The text content", max_length=128000, pattern=r"[\s\S]*"
     )
 
 
@@ -276,6 +293,14 @@ class Message(BaseModel):
         description="The input query/prompt to the pipeline. Can be a string for text-only messages, "
         "or an array of content objects for multimodal messages containing text and/or images.",
         default="Hello! What can you help me with?",
+    )
+    reasoning_content: str | None = Field(
+        default=None,
+        description="Reasoning trace or intermediate output from the agentic RAG pipeline. "
+        "Populated for streamed chunks whose ``event_type`` indicates a reasoning/intermediate "
+        "event (stage announcements, intermediate-stage reasoning or output tokens, "
+        "final-stage reasoning tokens). The user-facing answer is always streamed via "
+        "``content`` — this field is purely supplementary.",
     )
 
     @validator("role")
@@ -365,6 +390,22 @@ class ChainResponse(BaseModel):
         default=Metrics(),
         description="Latency metrics associated with the request",
     )
+    event_type: str | None = Field(
+        default=None,
+        description="Type of streaming chunk. None for non-streaming and for the regular "
+        "(non-agentic) path's content chunks. Set for agentic-RAG streaming chunks; see "
+        "``nvidia_rag.rag_server.agentic_rag.streaming.EventType`` for the enumerated values "
+        "(e.g. ``stage_start``, ``stage_end``, ``intermediate_reasoning``, "
+        "``intermediate_output``, ``final_reasoning``, ``final_answer``, "
+        "``agent_event``, ``error``).",
+    )
+    stage: str | None = Field(
+        default=None,
+        description="Name of the agentic-RAG graph node that produced this chunk "
+        "(e.g. ``initial_retrieval``, ``plan``, ``execute``, ``synthesize``, ``verify``, "
+        "``verify_execute``). Pairs with ``event_type`` so clients can group reasoning "
+        "by pipeline stage without parsing event_type. None for non-agentic responses.",
+    )
 
 
 def prepare_llm_request(messages: list[dict[str, Any]], **kwargs) -> dict[str, Any]:
@@ -416,6 +457,7 @@ def generate_answer(
     model: str = "",
     collection_name: str = "",
     enable_citations: bool = True,
+    use_nrl_citations: bool = False,
     context_reranker_time_ms: float | None = None,
     retrieval_time_ms: float | None = None,
     rag_start_time_sec: float | None = None,
@@ -430,10 +472,16 @@ def generate_answer(
         model: Name of the model used for generation
         collection_name: Name of the collection used for retrieval
         enable_citations: Whether to enable citations in the response
+        use_nrl_citations: When True, use ``prepare_citations_nrl`` (NRL /
+            LanceDB ingestion mode) instead of the standard ``prepare_citations``.
         otel_metrics_client: Optional OpenTelemetry metrics client for updating latency histograms
         token_usage: Optional mutable dict (e.g. {}) that a callback may populate with
             prompt_tokens, completion_tokens, and total_tokens for the final chunk.
     """
+    # Choose the citations builder based on ingestion mode.
+    # NRL (LanceDB backend) produces text-only flat metadata; nv-ingest
+    # produces structured metadata with optional object-store image assets.
+    _citations_fn = prepare_citations_nrl if use_nrl_citations else prepare_citations
 
     try:
         # unique response id for every query
@@ -451,7 +499,7 @@ def generate_answer(
             for chunk in generator:
                 # Accumulate chunks for final logging
                 accumulated_response += chunk
-                
+
                 # TODO: This is a hack to clear contexts if we get an error
                 # response from nemoguardrails
                 if chunk == "I'm sorry, I can't respond to that.":
@@ -482,7 +530,7 @@ def generate_answer(
                             "    == RAG Time to First Token (TTFT): %.2f ms ==",
                             rag_ttft_ms,
                         )
-                    chain_response.citations = prepare_citations(
+                    chain_response.citations = _citations_fn(
                         retrieved_documents=contexts,
                         enable_citations=enable_citations,
                     )
@@ -497,9 +545,11 @@ def generate_answer(
             logger.info("=" * 80)
             logger.info("Final LLM Response:")
             logger.info("  - Length: %d characters", len(accumulated_response))
-            logger.info("  - Content Preview (first 500 chars): %s%s", 
-                       accumulated_response[:500],
-                       "..." if len(accumulated_response) > 500 else "")
+            logger.info(
+                "  - Content Preview (first 500 chars): %s%s",
+                accumulated_response[:500],
+                "..." if len(accumulated_response) > 500 else "",
+            )
             if len(accumulated_response) > 500:
                 logger.info("  - Full response logged at DEBUG level")
                 logger.debug("Full LLM Response:\n%s", accumulated_response)
@@ -543,7 +593,8 @@ def generate_answer(
             chain_response.metrics = final_metrics
             if token_usage:
                 total = token_usage.get("total_tokens") or (
-                    token_usage.get("prompt_tokens", 0) + token_usage.get("completion_tokens", 0)
+                    token_usage.get("prompt_tokens", 0)
+                    + token_usage.get("completion_tokens", 0)
                 )
                 if total > 0:
                     chain_response.usage = Usage(
@@ -595,11 +646,13 @@ async def generate_answer_async(
     model: str = "",
     collection_name: str = "",
     enable_citations: bool = True,
+    use_nrl_citations: bool = False,
     context_reranker_time_ms: float | None = None,
     retrieval_time_ms: float | None = None,
     rag_start_time_sec: float | None = None,
     otel_metrics_client: OtelMetrics | None = None,
     token_usage: dict | None = None,
+    citations: Optional["Citations"] = None,
 ):
     """Generate and stream the response to the provided prompt asynchronously.
 
@@ -609,10 +662,19 @@ async def generate_answer_async(
         model: Name of the model used for generation
         collection_name: Name of the collection used for retrieval
         enable_citations: Whether to enable citations in the response
+        use_nrl_citations: When True, use ``prepare_citations_nrl`` (NRL /
+            LanceDB ingestion mode) instead of the standard ``prepare_citations``.
         otel_metrics_client: Optional OpenTelemetry metrics client for updating latency histograms
         token_usage: Optional mutable dict (e.g. {}) that a callback may populate with
             prompt_tokens, completion_tokens, and total_tokens for the final chunk.
+        citations: Optional pre-built Citations object (used by agentic RAG to pass
+            stage-annotated citations collected across pipeline stages). When provided,
+            this takes precedence over building citations from ``contexts``.
     """
+    # Choose the citations builder based on ingestion mode.
+    # NRL (LanceDB backend) produces text-only flat metadata; nv-ingest
+    # produces structured metadata with optional object-store image assets.
+    _citations_fn = prepare_citations_nrl if use_nrl_citations else prepare_citations
 
     try:
         # unique response id for every query
@@ -630,7 +692,7 @@ async def generate_answer_async(
             async for chunk in generator:
                 # Accumulate chunks for final logging
                 accumulated_response += chunk
-                
+
                 # TODO: This is a hack to clear contexts if we get an error
                 # response from nemoguardrails
                 if chunk == "I'm sorry, I can't respond to that.":
@@ -661,10 +723,13 @@ async def generate_answer_async(
                             "    == RAG Time to First Token (TTFT): %.2f ms ==",
                             rag_ttft_ms,
                         )
-                    chain_response.citations = prepare_citations(
-                        retrieved_documents=contexts,
-                        enable_citations=enable_citations,
-                    )
+                    if citations is not None:
+                        chain_response.citations = citations
+                    else:
+                        chain_response.citations = _citations_fn(
+                            retrieved_documents=contexts,
+                            enable_citations=enable_citations,
+                        )
                     first_chunk = False
                 logger.debug(response_choice)
                 # Send generator with tokens in ChainResponse format
@@ -676,9 +741,11 @@ async def generate_answer_async(
             logger.info("=" * 80)
             logger.info("Final LLM Response:")
             logger.info("  - Length: %d characters", len(accumulated_response))
-            logger.info("  - Content Preview (first 500 chars): %s%s", 
-                       accumulated_response[:500],
-                       "..." if len(accumulated_response) > 500 else "")
+            logger.info(
+                "  - Content Preview (first 500 chars): %s%s",
+                accumulated_response[:500],
+                "..." if len(accumulated_response) > 500 else "",
+            )
             if len(accumulated_response) > 500:
                 logger.info("  - Full response logged at DEBUG level")
                 logger.debug("Full LLM Response:\n%s", accumulated_response)
@@ -722,7 +789,8 @@ async def generate_answer_async(
             chain_response.metrics = final_metrics
             if token_usage:
                 total = token_usage.get("total_tokens") or (
-                    token_usage.get("prompt_tokens", 0) + token_usage.get("completion_tokens", 0)
+                    token_usage.get("prompt_tokens", 0)
+                    + token_usage.get("completion_tokens", 0)
                 )
                 if total > 0:
                     chain_response.usage = Usage(
@@ -794,6 +862,10 @@ def prepare_citations(
     """
     citations = []
 
+    logger.info(
+        f"[Prepare Citations] Length of retrieved documents: {len(retrieved_documents)}"
+    )
+
     if force_citations or enable_citations:
         for doc in retrieved_documents:
             content = ""
@@ -844,14 +916,15 @@ def prepare_citations(
                 try:
                     if enable_citations:
                         logger.debug(
-                            "Pulling content from minio for image/table/chart for citations ..."
+                            "Pulling content from object storage for image/table/chart citations ..."
                         )
                         source_location = doc.metadata.get("source").get(
                             "source_location"
                         )
                         if source_location:
-                            object_name = object_key_from_storage_uri(source_location)
-                            raw_content = get_minio_operator_instance().get_object(object_name)
+                            raw_content = get_object_store_operator_instance().get_object_from_uri(
+                                source_location
+                            )
                             content = base64.b64encode(raw_content).decode("ascii")
                         else:
                             content = ""
@@ -869,7 +942,7 @@ def prepare_citations(
                         )
                 except Exception as e:
                     logger.exception(
-                        f"Error pulling content from minio for image/table/chart for citations: {e}"
+                        f"Error pulling content from object storage for image/table/chart for citations: {e}"
                     )
                     content = ""
                     source_metadata = SourceMetadata(
@@ -878,7 +951,7 @@ def prepare_citations(
                     )
 
             # If content is empty for image/text/table/chart/audio, skip adding to citations
-            # No content: asset is not available in MinIO, may cause an error in the UI client
+            # No content: asset is not available in object storage, may cause an error in the UI client
             if content and document_type in [
                 "image",
                 "text",
@@ -896,6 +969,192 @@ def prepare_citations(
                 )
                 citations.append(source_result)
 
+    return Citations(total_results=len(citations), results=citations)
+
+
+def prepare_citations_nrl(
+    retrieved_documents: list[Document],
+    force_citations: bool = False,
+    enable_citations: bool = True,
+) -> Citations:
+    """Prepare citations for documents ingested via NRL (NemoRetriever Library).
+
+    NRL stores both text and image chunks in LanceDB.  Text chunks carry their
+    content directly in ``page_content``; image / chart / table chunks reference
+    an object-store URI in the ``stored_image_uri`` metadata column.  When
+    ``stored_image_uri`` is present and non-empty, this function fetches the
+    image bytes from object storage and returns them base64-encoded — exactly the same
+    approach used by ``prepare_citations`` for nv-ingest image chunks.
+
+    Document.metadata layout (set by ``NRLLanceDB.results_to_docs``):
+
+    +-----------------+----------------------------------------------------+
+    | Key             | Description                                        |
+    +=================+====================================================+
+    | filename        | Source file name (str).                            |
+    | path            | Full source file path (str).                       |
+    | source          | Source path as a plain string (str).               |
+    | source_id       | Unique source identifier (str).                    |
+    | page_number     | PDF page number (int).                             |
+    | pdf_page        | ``<basename>_<page>`` composite key (str).         |
+    | pdf_basename    | PDF basename without extension (str).              |
+    | stored_image_uri| Object-store URI for image chunks; empty for text. |
+    | content_type    | NRL content type: ``text``, ``image``, ``chart``,  |
+    |                 | ``table``, ``infographic``, etc. (str).            |
+    | bbox_xyxy_norm  | Bounding-box JSON string (str).                    |
+    | metadata        | Parsed NRL metadata dict (ast.literal_eval result).|
+    | _distance       | ANN distance score (float, optional).              |
+    +-----------------+----------------------------------------------------+
+
+    Parameters
+    ----------
+    retrieved_documents:
+        LangChain Documents returned by ``LanceDBVDB.retrieval_langchain``.
+    force_citations:
+        When ``True``, return citations even if ``enable_citations`` is
+        ``False`` (used by the ``/search`` API endpoint).
+    enable_citations:
+        Global citations toggle from server configuration.
+
+    Returns
+    -------
+    Citations
+        Populated ``Citations`` object.  Each ``SourceResult`` carries either
+        plain text (``content = page_content``) or a base64-encoded image
+        fetched from object storage (when ``stored_image_uri`` is set).
+    """
+    citations = []
+
+    logger.info(
+        "[Prepare Citations NRL] Processing %d retrieved documents.",
+        len(retrieved_documents),
+    )
+
+    if not (force_citations or enable_citations):
+        return Citations(total_results=0, results=[])
+
+    # Map NRL content-type strings → SourceResult.document_type literals.
+    # "infographic" has no direct equivalent in the API type; treat as "image".
+    _NRL_TYPE_MAP: dict[str, str] = {
+        "text": "text",
+        "image": "image",
+        "image_caption": "image",
+        "chart": "chart",
+        "chart_caption": "chart",
+        "table": "table",
+        "table_caption": "table",
+        "audio": "audio",
+        "infographic": "image",
+        "infographic_caption": "image",
+    }
+
+    for doc in retrieved_documents:
+        meta = doc.metadata
+
+        # ── Identify chunk type ───────────────────────────────────────────
+        # stored_image_uri is the authoritative signal: non-empty means the
+        # chunk is a visual asset (image / chart / table) stored in object storage.
+        stored_image_uri: str = meta.get("stored_image_uri") or ""
+        nrl_content_type: str = str(meta.get("content_type") or "").strip().lower()
+
+        if stored_image_uri:
+            # Visual chunk: document_type from content_type, defaulting to "image".
+            document_type = _NRL_TYPE_MAP.get(nrl_content_type, "image")
+        else:
+            # Text chunk: document_type from content_type, defaulting to "text".
+            document_type = _NRL_TYPE_MAP.get(nrl_content_type, "text")
+
+        # ── Resolve content ───────────────────────────────────────────────
+        content = ""
+
+        if stored_image_uri and document_type != "text":
+            # Image / chart / table chunk — fetch raw bytes from object storage and
+            # base64-encode them, mirroring prepare_citations for nv-ingest.
+            if enable_citations:
+                try:
+                    logger.debug(
+                        "[Prepare Citations NRL] Fetching visual asset from object storage: %s",
+                        stored_image_uri,
+                    )
+                    raw_bytes = (
+                        get_object_store_operator_instance().get_object_from_uri(
+                            stored_image_uri
+                        )
+                    )
+                    content = base64.b64encode(raw_bytes).decode("ascii")
+                except Exception as exc:
+                    logger.exception(
+                        "[Prepare Citations NRL] Failed to fetch asset from object storage"
+                        " (uri=%s): %s",
+                        stored_image_uri,
+                        exc,
+                    )
+                    content = ""
+            # When citations are disabled, content stays empty and the chunk
+            # is skipped by the guard below, so no object-store call is made.
+        else:
+            # Text / audio chunk — content comes directly from the chunk text.
+            content = doc.page_content or ""
+
+        # Skip chunks that produced no renderable content.
+        # This mirrors the guard in prepare_citations and prevents empty
+        # entries in the citation list that could confuse the UI client.
+        if not content:
+            continue
+
+        if document_type not in ("image", "text", "table", "chart", "audio"):
+            # document_type is not in the API Literal — skip rather than send
+            # an invalid value that would fail Pydantic validation downstream.
+            logger.debug(
+                "[Prepare Citations NRL] Skipping chunk with unmapped document_type=%r",
+                document_type,
+            )
+            continue
+
+        # ── Document name ─────────────────────────────────────────────────
+        # Prefer "filename" (set directly by NRL), fall back to path / source.
+        raw_filename = (
+            meta.get("filename") or meta.get("path") or meta.get("source") or ""
+        )
+        document_name = os.path.basename(str(raw_filename)) if raw_filename else ""
+
+        # ── Page number ───────────────────────────────────────────────────
+        try:
+            page_number = int(meta.get("page_number") or 0)
+        except (TypeError, ValueError):
+            page_number = 0
+
+        # ── Relevance / distance score ────────────────────────────────────
+        # "relevance_score" is populated by the reranker; "_distance" is the
+        # raw ANN distance from LanceDB.  Fall back to 0.0 when neither exists.
+        score = float(meta.get("relevance_score") or meta.get("_distance") or 0.0)
+
+        # ── NRL metadata dict (has_text, dpi, source_path, etc.) ─────────
+        # Stored under "metadata" as a parsed dict by NRLLanceDB.results_to_docs.
+        # Passed as content_metadata so API consumers can inspect provenance.
+        nrl_meta: dict = meta.get("metadata") or {}
+
+        source_metadata = SourceMetadata(
+            page_number=page_number,
+            description=doc.page_content or "",
+            content_metadata=nrl_meta,
+        )
+
+        citations.append(
+            SourceResult(
+                content=content,
+                document_type=document_type,
+                document_name=document_name,
+                score=score,
+                metadata=source_metadata,
+            )
+        )
+
+    logger.info(
+        "[Prepare Citations NRL] Built %d citations from %d documents.",
+        len(citations),
+        len(retrieved_documents),
+    )
     return Citations(total_results=len(citations), results=citations)
 
 
@@ -977,7 +1236,7 @@ async def retrieve_summary(
     """
     Get the summary of a document with Redis-based status tracking.
 
-    This function checks Redis for generation status before polling MinIO,
+    This function checks Redis for generation status before polling object storage,
     enabling efficient status queries and proper error reporting.
 
     Args:
@@ -1000,7 +1259,7 @@ async def retrieve_summary(
             status_data = SUMMARY_STATUS_HANDLER.get_status(collection_name, file_name)
         else:
             logger.debug(
-                "Redis unavailable - skipping status check, will attempt direct MinIO retrieval"
+                "Redis unavailable - skipping status check, will attempt direct object-store retrieval"
             )
 
         # STEP 2: Handle status from Redis
@@ -1037,7 +1296,7 @@ async def retrieve_summary(
                     "completed_at": status_data.get("completed_at"),
                 }
 
-        # STEP 3: Check MinIO for summary content
+        # STEP 3: Check object storage for summary content
         unique_thumbnail_id = get_unique_thumbnail_id(
             collection_name=f"summary_{collection_name}",
             file_name=file_name,
@@ -1045,7 +1304,7 @@ async def retrieve_summary(
             location=[],
         )
 
-        payload = get_minio_operator_instance().get_payload(
+        payload = get_object_store_operator_instance().get_payload(
             object_name=unique_thumbnail_id
         )
 
@@ -1109,16 +1368,16 @@ async def _wait_for_summary_completion(
         # Check if Redis is available
         if not SUMMARY_STATUS_HANDLER.is_available():
             logger.warning(
-                "Redis connection lost during polling - falling back to MinIO checks"
+                "Redis connection lost during polling - falling back to object-store checks"
             )
-            # Fall back to MinIO-only polling
+            # Fall back to object-store-only polling
             unique_thumbnail_id = get_unique_thumbnail_id(
                 collection_name=f"summary_{collection_name}",
                 file_name=file_name,
                 page_number=0,
                 location=[],
             )
-            payload = get_minio_operator_instance().get_payload(
+            payload = get_object_store_operator_instance().get_payload(
                 object_name=unique_thumbnail_id
             )
             if payload:
@@ -1136,7 +1395,7 @@ async def _wait_for_summary_completion(
             if status_data:
                 status = status_data.get("status")
 
-                # Success - fetch from MinIO
+                # Success - fetch from object storage
                 if status == "SUCCESS":
                     unique_thumbnail_id = get_unique_thumbnail_id(
                         collection_name=f"summary_{collection_name}",
@@ -1144,7 +1403,7 @@ async def _wait_for_summary_completion(
                         page_number=0,
                         location=[],
                     )
-                    payload = get_minio_operator_instance().get_payload(
+                    payload = get_object_store_operator_instance().get_payload(
                         object_name=unique_thumbnail_id
                     )
                     if payload:
@@ -1158,7 +1417,7 @@ async def _wait_for_summary_completion(
                     else:
                         # Status says SUCCESS but no content - this is an error
                         logger.error(
-                            f"Summary status is SUCCESS but content not found in MinIO for {file_name}"
+                            f"Summary status is SUCCESS but content not found in object storage for {file_name}"
                         )
                         return {
                             "message": f"Summary marked as complete but content not found in storage for {file_name}",

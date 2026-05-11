@@ -4,12 +4,12 @@
 
 # Vector Store Configuration
 vector_store:
-  name: "milvus"  # Name of the vector store backend (e.g., milvus, elasticsearch)
-  url: "http://localhost:19530"  # URL endpoint for the vector store service
-  index_type: "GPU_CAGRA"  # Type of vector index (e.g., GPU_CAGRA, IVF_FLAT)
+  name: "elasticsearch"  # Name of the vector store backend (e.g., milvus, elasticsearch)
+  url: "http://localhost:9200"  # URL endpoint for the vector store service
+  index_type: "hnsw"  # Type of vector index (e.g., GPU_CAGRA, IVF_FLAT)
   search_type: "dense"  # Type of search to perform (dense, hybrid)
-  enable_gpu_index: true  # Enable GPU acceleration for index building
-  enable_gpu_search: true  # Enable GPU acceleration for search operations
+  enable_gpu_index: false  # Enable GPU acceleration for index building
+  enable_gpu_search: false  # Enable GPU acceleration for search operations
   default_collection_name: "test_native"  # Default collection/index name for storing vectors
 
 # NV-Ingest Configuration
@@ -27,7 +27,7 @@ nv_ingest:
   chunk_overlap: 150  # Number of overlapping tokens between chunks
   caption_model_name: "nvidia/nemotron-nano-12b-v2-vl"  # Model name for generating image captions
   caption_endpoint_url: "http://localhost:1977/v1/chat/completions"  # API endpoint for caption generation service
-  enable_pdf_splitter: true  # Enable PDF page splitting during ingestion
+  enable_paged_doc_split: false  # Enable paged document splitting during ingestion
 
 # LLM Configuration
 llm:
@@ -85,11 +85,12 @@ vlm:
   model_name: "nvidia/nemotron-nano-12b-v2-vl"  # Vision-Language Model for processing images and text
   # api_key: ""  # Optional: API key for VLM service (overrides NVIDIA_API_KEY environment variable)
 
-# MinIO Configuration
-minio:
-  endpoint: "localhost:9010"  # MinIO object storage endpoint
-  access_key: "minioadmin"  # MinIO access key for authentication
-  secret_key: "minioadmin"  # MinIO secret key for authentication
+# Object-store Configuration
+object_store:
+  endpoint: "localhost:9010"  # Host endpoint used by the notebook kernel
+  nv_ingest_endpoint: "seaweedfs:9010"  # Docker-network endpoint used by NV-Ingest
+  access_key: "seaweedfsadmin"  # Object-store access key for authentication
+  secret_key: "seaweedfsadmin"  # Object-store secret key for authentication
 
 # Summarizer Configuration
 summarizer:
@@ -115,4 +116,32 @@ reflection:
 enable_guardrails: false  # Enable safety guardrails for input/output filtering
 enable_citations: true  # Include source citations in generated responses
 enable_vlm_inference: false  # Enable Vision-Language Model for multimodal queries
+enable_agentic_rag: false  # Route knowledge-base queries through the LangGraph plan-and-execute agentic pipeline
 temp_dir: "./tmp-data/"  # Temporary directory for file processing and storage
+
+# Agentic RAG Configuration (LangGraph plan-and-execute pipeline)
+# Per-role LLM configuration. All four roles use the same model in the reference config;
+# set different values per role to use a smaller/cheaper model for non-critical roles.
+# If a role's model_name is empty, the builder falls back to planner_llm.
+agentic_rag:
+  planner_llm:
+    server_url: "http://localhost:8999"  # URL endpoint for the planner LLM (scope resolution + task creation)
+    model_name: "nvidia/nemotron-3-super-120b-a12b"  # Model name for the planner LLM
+    # api_key: ""  # Optional: API key for planner LLM (overrides NVIDIA_API_KEY)
+  task_llm:
+    server_url: "http://localhost:8999"  # URL endpoint for the task LLM (answering individual sub-questions)
+    model_name: "nvidia/nemotron-3-super-120b-a12b"  # Model name for the task LLM
+    # api_key: ""  # Optional: API key for task LLM (overrides NVIDIA_API_KEY)
+  seed_gen_llm:
+    server_url: "http://localhost:8999"  # URL endpoint for the seed-gen LLM (retry seed query generation)
+    model_name: "nvidia/nemotron-3-super-120b-a12b"  # Model name for the seed-gen LLM
+    # api_key: ""  # Optional: API key for seed-gen LLM (overrides NVIDIA_API_KEY)
+  synthesis_llm:
+    server_url: "http://localhost:8999"  # URL endpoint for the synthesis LLM (final answer generation)
+    model_name: "nvidia/nemotron-3-super-120b-a12b"  # Model name for the synthesis LLM
+    # api_key: ""  # Optional: API key for synthesis LLM (overrides NVIDIA_API_KEY)
+  log_level: "INFO"  # Logging level for the agentic RAG agent (DEBUG/INFO/WARNING/ERROR)
+  verification:
+    enabled: false  # Toggle verification pass on/off (enable for higher-accuracy at extra cost)
+  context:
+    max_tokens: 100000  # Token budget for retrieved chunks passed to the agent

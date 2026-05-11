@@ -71,6 +71,17 @@ For monitoring deployment progress, refer to [Deploy on Kubernetes with Helm](./
 
     For more details, see instructions [here](https://docs.nvidia.com/nim-operator/latest/install.html).
 
+11. Install the ECK operator. Elasticsearch is the default vector database for this chart; the ECK operator manages Elasticsearch on Kubernetes.
+
+    ```sh
+    helm repo add elastic https://helm.elastic.co
+    helm repo update
+    helm install elastic-operator elastic/eck-operator -n elastic-system --create-namespace
+    ```
+
+  If you switch from the default stack to Milvus or another standalone backend and turn off the chart-managed Elasticsearch, the ECK operator is no longer required. See [Vector database configuration](change-vectordb.md) for details.
+
+    For verification commands and Elasticsearch tuning in Helm, see [Vector database configuration](change-vectordb.md).
 
 
 ## Step 1: Enable MIG with Mixed Strategy
@@ -188,7 +199,7 @@ You should see output similar to the following.
 Run the following code to install the RAG Blueprint Helm Chart.
 
 ```bash
-helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/charts/nvidia-blueprint-rag-v2.5.0.tgz \
+helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvstaging/blueprint/charts/nvidia-blueprint-rag-v2.6.0-rc1.tgz \
   --username '$oauthtoken' \
   --password "${NGC_API_KEY}" \
   --set imagePullSecret.password=$NGC_API_KEY \
@@ -202,7 +213,7 @@ helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/c
 If you are deploying on NVIDIA RTX6000 Pro GPUs (instead of H100 GPUs), use [`values-mig-rtx6000.yaml`](../deploy/helm/mig-slicing/values-mig-rtx6000.yaml) and [`mig-config-rtx6000.yaml`](../deploy/helm/mig-slicing/mig-config-rtx6000.yaml) which include the RTX6000-specific MIG profiles and NIM LLM model configuration.
 
 ```sh
-helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/charts/nvidia-blueprint-rag-v2.5.0.tgz \
+helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvstaging/blueprint/charts/nvidia-blueprint-rag-v2.6.0-rc1.tgz \
   --username '$oauthtoken' \
   --password "${NGC_API_KEY}" \
   --set imagePullSecret.password=$NGC_API_KEY \

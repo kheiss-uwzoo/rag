@@ -8,8 +8,10 @@ vector_store:
   url: "http://localhost:9200"  # URL endpoint for the vector store service
   index_type: "GPU_CAGRA"  # Type of vector index (e.g., GPU_CAGRA, IVF_FLAT)
   search_type: "dense"  # Type of search to perform (dense, hybrid)
-  enable_gpu_index: false  # Milvus only (ignored for Elasticsearch); set true for Milvus + GPU
-  enable_gpu_search: false  # Milvus only (ignored for Elasticsearch); set true for Milvus + GPU
+  # Same env as APP_VECTORSTORE_ENABLEGPUINDEX — applies to Milvus and Elasticsearch (ES needs GPU image + license; see docs).
+  enable_gpu_index: false
+  # Same env as APP_VECTORSTORE_ENABLEGPUSEARCH — Milvus only; Elasticsearch does not support GPU search.
+  enable_gpu_search: false
   default_collection_name: "test_native"  # Default collection/index name for storing vectors
 
 # NV-Ingest Configuration
@@ -27,7 +29,7 @@ nv_ingest:
   chunk_overlap: 150  # Number of overlapping tokens between chunks
   caption_model_name: "nvidia/nemotron-nano-12b-v2-vl"  # Model name for generating image captions
   caption_endpoint_url: "http://localhost:1977/v1/chat/completions"  # API endpoint for caption generation service
-  enable_pdf_splitter: true  # Enable PDF page splitting during ingestion
+  enable_paged_doc_split: false  # Enable paged document splitting during ingestion
 
 # LLM Configuration
 llm:
@@ -85,11 +87,12 @@ vlm:
   model_name: "nvidia/nemotron-nano-12b-v2-vl"  # Vision-Language Model for processing images and text
   # api_key: ""  # Optional: API key for VLM service (overrides NVIDIA_API_KEY environment variable)
 
-# MinIO Configuration
-minio:
-  endpoint: "localhost:9010"  # MinIO object storage endpoint
-  access_key: "minioadmin"  # MinIO access key for authentication
-  secret_key: "minioadmin"  # MinIO secret key for authentication
+# Object Store Configuration
+object_store:
+  endpoint: "localhost:9010"  # S3-compatible object-store endpoint
+  nv_ingest_endpoint: "seaweedfs:9010"  # Docker-network endpoint used by NV-Ingest
+  access_key: "seaweedfsadmin"  # Object-store access key for authentication
+  secret_key: "seaweedfsadmin"  # Object-store secret key for authentication
 
 # Summarizer Configuration
 summarizer:

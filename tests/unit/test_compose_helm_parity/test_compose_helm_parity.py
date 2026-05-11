@@ -240,6 +240,10 @@ def test_compose_helm_image_and_env_parity():
                     "APP_VLM_APIKEY",
                     "SUMMARY_LLM_APIKEY",
                     "REFLECTION_LLM_APIKEY",
+                    "AGENTIC_PLANNER_LLM_APIKEY",
+                    "AGENTIC_TASK_LLM_APIKEY",
+                    "AGENTIC_SEED_GEN_LLM_APIKEY",
+                    "AGENTIC_SYNTHESIS_LLM_APIKEY",
                 },
             },
             "rag-frontend": {
@@ -390,22 +394,10 @@ def test_compose_helm_image_and_env_parity():
                     "tag",
                 ],
             },
-            # MinIO image parity (managed by nv-ingest.milvus.minio)
-            "minio": {
-                "values_image_repo_path": [
-                    "nv-ingest",
-                    "milvus",
-                    "minio",
-                    "image",
-                    "repository",
-                ],
-                "values_image_tag_path": [
-                    "nv-ingest",
-                    "milvus",
-                    "minio",
-                    "image",
-                    "tag",
-                ],
+            # SeaweedFS image parity (managed directly by the chart)
+            "seaweedfs": {
+                "values_image_repo_path": ["seaweedfs", "image", "repository"],
+                "values_image_tag_path": ["seaweedfs", "image", "tag"],
             },
         },
     }

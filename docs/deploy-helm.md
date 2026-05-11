@@ -69,6 +69,18 @@ Plan for additional space if you are enabling persistence for multiple services.
 
     For more details, see instructions [here](https://docs.nvidia.com/nim-operator/latest/install.html).
 
+11. Install the Elastic Cloud on Kubernetes (ECK) operator. Elasticsearch is the default vector database for this chart; the ECK operator manages Elasticsearch on Kubernetes.
+
+    ```sh
+    helm repo add elastic https://helm.elastic.co
+    helm repo update
+    helm install elastic-operator elastic/eck-operator -n elastic-system --create-namespace
+    ```
+
+    If you replace the default stack with Milvus or another backend only and disable chart-managed Elasticsearch, you do not need the ECK operator—see [Vector database configuration](change-vectordb.md).
+
+    For verification commands and Elasticsearch tuning in Helm, see [Vector database configuration](change-vectordb.md).
+
 
 ## Deploy the RAG Helm chart
 
@@ -87,7 +99,7 @@ To deploy End-to-End RAG Server and Ingestor Server, use the following procedure
 2. Install the Helm chart by running the following command.
 
     ```sh
-    helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/charts/nvidia-blueprint-rag-v2.5.0.tgz \
+    helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvstaging/blueprint/charts/nvidia-blueprint-rag-v2.6.0-rc1.tgz \
     --username '$oauthtoken' \
     --password "${NGC_API_KEY}" \
     --set imagePullSecret.password=$NGC_API_KEY \
@@ -112,7 +124,7 @@ To deploy End-to-End RAG Server and Ingestor Server, use the following procedure
    
    Then install using the modified values.yaml:
    ```sh
-   helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/charts/nvidia-blueprint-rag-v2.5.0.tgz \
+   helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvstaging/blueprint/charts/nvidia-blueprint-rag-v2.6.0-rc1.tgz \
      --username '$oauthtoken' \
      --password "${NGC_API_KEY}" \
      --set imagePullSecret.password=$NGC_API_KEY \
@@ -157,7 +169,7 @@ You should see output similar to the following. With the default Elasticsearch v
     nim-llm-7cb9bdcc89-hwpkq                             1/1     Running     0          11m
     nim-llm-cache-job-77hpc                              0/1     Completed   0          94s
     rag-frontend-5db7874b77-49q8f                        1/1     Running     0          54m
-    rag-minio-649f6476c-n29b8                            1/1     Running     0          54m
+    rag-seaweedfs-all-in-one-649f6476c-n29b8              1/1     Running     0          54m
     rag-nv-ingest-6bf4d98866-kbgg7                       1/1     Running     0          54m
     rag-redis-master-0                                   1/1     Running     0          54m
     rag-redis-replicas-0                                 1/1     Running     0          54m
@@ -218,7 +230,7 @@ You should see output similar to the following. With the default Elasticsearch v
     nemotron-table-structure-v1    ClusterIP   10.107.227.139   <none>        8000/TCP,8001/TCP    54m
     nim-llm                             ClusterIP   10.104.60.155    <none>        8000/TCP,8001/TCP    54m
     rag-frontend                        NodePort    10.100.190.142   <none>        3000:31473/TCP       54m
-    rag-minio                           ClusterIP   10.101.18.143    <none>        9000/TCP             54m
+    rag-seaweedfs-all-in-one            ClusterIP   10.101.18.143    <none>        9010/TCP             54m
     rag-nv-ingest                       ClusterIP   10.107.186.4     <none>        7670/TCP             54m
     rag-redis-headless                  ClusterIP   None             <none>        6379/TCP             54m
     rag-redis-master                    ClusterIP   10.105.178.202   <none>        6379/TCP             54m
@@ -249,7 +261,7 @@ Port-forwarding is provided as a quick method to try out the UI. However, large 
 To change an existing deployment, after you modify the [`values.yaml`](../deploy/helm/nvidia-blueprint-rag/values.yaml) file, run the following code.
 
 ```sh
-helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvidia/blueprint/charts/nvidia-blueprint-rag-v2.5.0.tgz \
+helm upgrade --install rag -n rag https://helm.ngc.nvidia.com/nvstaging/blueprint/charts/nvidia-blueprint-rag-v2.6.0-rc1.tgz \
 --username '$oauthtoken' \
 --password "${NGC_API_KEY}" \
 --set imagePullSecret.password=$NGC_API_KEY \

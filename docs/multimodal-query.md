@@ -12,7 +12,7 @@ The multimodal query feature in the [NVIDIA RAG Blueprint](readme.md) enables yo
 
 This feature combines:
 - **VLM Embeddings**: `nvidia/llama-nemotron-embed-vl-1b-v2` for creating multimodal embeddings that understand both text and images
-- **Vision-Language Model**: `nvidia/nemotron-nano-12b-v2-vl` for generating intelligent responses based on visual and textual context
+- **Vision-Language Model**: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` for generating intelligent responses based on visual and textual context
 
 
 
@@ -81,7 +81,7 @@ Set the model names and service URLs for the RAG pipeline:
 
 ```bash
 # VLM (Vision-Language Model) configuration
-export APP_VLM_MODELNAME="nvidia/nemotron-nano-12b-v2-vl"
+export APP_VLM_MODELNAME="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 export APP_VLM_SERVERURL="http://vlm-ms:8000/v1"
 export APP_LLM_SERVERURL=""
 
@@ -169,7 +169,7 @@ Then set the VLM configuration:
 
 ```bash
 # VLM (Vision-Language Model) configuration - cloud hosted
-export APP_VLM_MODELNAME="nvidia/nemotron-nano-12b-v2-vl"
+export APP_VLM_MODELNAME="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 export APP_VLM_SERVERURL="https://integrate.api.nvidia.com"
 export APP_LLM_SERVERURL=""
 
@@ -227,7 +227,7 @@ compose-redis-1                         Up 5 minutes
 rag-frontend                            Up 9 minutes
 rag-server                              Up 9 minutes
 milvus-standalone                       Up 36 minutes (healthy)
-milvus-minio                            Up 35 minutes (healthy)
+seaweedfs                               Up 35 minutes (healthy)
 milvus-etcd                             Up 35 minutes (healthy)
 ```
 
@@ -274,7 +274,7 @@ envVars:
   # VLM inference settings
   ENABLE_VLM_INFERENCE: "true"
   VLM_TO_LLM_FALLBACK: "false"
-  APP_VLM_MODELNAME: "nvidia/nemotron-nano-12b-v2-vl"
+  APP_VLM_MODELNAME: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
   APP_VLM_SERVERURL: "http://nim-vlm:8000/v1"
 
   # VLM embedding settings
@@ -385,11 +385,10 @@ For a step-by-step guide with code examples covering collection creation, docume
 ## Related Topics
 
 - [Vision-Language Model (VLM) for Generation](vlm.md)
-- [VLM Embedding for Ingestion](vlm-embed.md)
+- [Multimodal Retriever (VLM Embedding & VLM Reranker)](multimodal-retriever.md)
 - [Image Captioning Support](image_captioning.md)
 - [Deploy with Docker (Self-Hosted Models)](deploy-docker-self-hosted.md)
 - [Deploy with Docker (NVIDIA-Hosted Models)](deploy-docker-nvidia-hosted.md)
 - [Deploy with Helm](deploy-helm.md)
 - [Troubleshoot](troubleshooting.md)
 - [Notebooks](notebooks.md)
-

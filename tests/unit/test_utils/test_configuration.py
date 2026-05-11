@@ -19,18 +19,21 @@ import json
 import os
 import tempfile
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
+from pydantic import SecretStr, ValidationError
+
 from nvidia_rag.utils.configuration import (
     EmbeddingConfig,
     FilterExpressionGeneratorConfig,
     LLMConfig,
-    MinioConfig,
     ModelParametersConfig,
     NvidiaRAGConfig,
     NvIngestConfig,
+    ObjectStoreConfig,
     QueryRewriterConfig,
     RankingConfig,
     ReflectionConfig,
@@ -42,7 +45,6 @@ from nvidia_rag.utils.configuration import (
     VectorStoreConfig,
     VLMConfig,
 )
-from pydantic import SecretStr, ValidationError
 
 
 class TestVectorStoreConfig:
@@ -126,8 +128,8 @@ class TestLLMConfig:
         assert config.model_engine == "nvidia-ai-endpoints"
         assert isinstance(config.parameters, ModelParametersConfig)
         assert config.parameters.max_tokens == 32768
-        assert config.parameters.temperature == 0
-        assert config.parameters.top_p == 1.0
+        assert config.parameters.temperature is None
+        assert config.parameters.top_p is None
 
     def test_get_model_parameters_default(self):
         """Test get_model_parameters with default model (nemotron pattern)."""
@@ -143,8 +145,8 @@ class TestLLMConfig:
             "low_effort": False,
             "min_thinking_tokens": 0,
             "max_thinking_tokens": 0,
-            "temperature": 0.0,
-            "top_p": 1.0,
+            "temperature": None,
+            "top_p": None,
         }
         assert params == expected
 
@@ -162,8 +164,8 @@ class TestLLMConfig:
             "low_effort": False,
             "min_thinking_tokens": 0,
             "max_thinking_tokens": 0,
-            "temperature": 0.0,
-            "top_p": 1.0,
+            "temperature": None,
+            "top_p": None,
         }
         assert params == expected
 
@@ -235,16 +237,72 @@ class TestRetrieverConfig:
         assert config.fetch_neighboring_pages == 0
 
 
-class TestMinioConfig:
-    """Test cases for MinioConfig."""
+class TestObjectStoreConfig:
+    """Test cases for ObjectStoreConfig."""
 
     def test_default_values(self):
         """Test default configuration values."""
-        config = MinioConfig()
+        config = ObjectStoreConfig()
 
+        assert config.backend == "s3"
         assert config.endpoint == "localhost:9010"
-        assert config.access_key.get_secret_value() == "minioadmin"
-        assert config.secret_key.get_secret_value() == "minioadmin"
+        assert config.endpoint_url == "http://localhost:9010"
+        assert config.nv_ingest_endpoint is None
+        assert config.nv_ingest_endpoint_url == "http://localhost:9010"
+        assert config.storage_root == Path("/tmp/nvidia-rag-object-store").resolve()
+        assert config.access_key.get_secret_value() == "seaweedfsadmin"
+        assert config.secret_key.get_secret_value() == "seaweedfsadmin"
+
+    @patch.dict(os.environ, {"OBJECTSTORE_ENDPOINT": "https://bucket.example:9443"})
+    def test_endpoint_url_normalizes_https(self):
+        config = ObjectStoreConfig()
+
+        assert config.endpoint == "bucket.example:9443"
+        assert config.endpoint_url == "https://bucket.example:9443"
+        assert config.nv_ingest_endpoint_url == "https://bucket.example:9443"
+        assert config.secure is True
+
+    def test_nv_ingest_endpoint_can_differ_from_host_endpoint(self):
+        config = ObjectStoreConfig(
+            endpoint="localhost:9010",
+            nv_ingest_endpoint="seaweedfs:9010",
+        )
+
+        assert config.endpoint_url == "http://localhost:9010"
+        assert config.nv_ingest_endpoint == "seaweedfs:9010"
+        assert config.nv_ingest_endpoint_url == "http://seaweedfs:9010"
+
+    def test_nv_ingest_endpoint_url_normalizes_https_independently(self):
+        config = ObjectStoreConfig(
+            endpoint="localhost:9010",
+            nv_ingest_endpoint="https://bucket.internal:9443",
+        )
+
+        assert config.endpoint_url == "http://localhost:9010"
+        assert config.nv_ingest_endpoint == "bucket.internal:9443"
+        assert config.nv_ingest_endpoint_url == "https://bucket.internal:9443"
+
+    def test_nv_ingest_endpoint_inherits_primary_secure_without_scheme(self):
+        config = ObjectStoreConfig(
+            endpoint="https://bucket.example:9443",
+            nv_ingest_endpoint="bucket.internal:9443",
+        )
+
+        assert config.endpoint_url == "https://bucket.example:9443"
+        assert config.nv_ingest_endpoint_url == "https://bucket.internal:9443"
+
+    @patch.dict(
+        os.environ,
+        {
+            "OBJECTSTORE_BACKEND": "filesystem",
+            "OBJECTSTORE_LOCAL_PATH": "/tmp/rag-fs-store",
+        },
+    )
+    def test_filesystem_backend_configuration(self):
+        config = ObjectStoreConfig()
+
+        assert config.backend == "filesystem"
+        assert config.storage_root == Path("/tmp/rag-fs-store").resolve()
 
 
 class TestSummarizerConfig:
@@ -304,12 +362,20 @@ class TestNvIngestConfig:
         assert config.tokenizer == "intfloat/e5-large-unsupervised"
         assert config.chunk_size == 1024
         assert config.chunk_overlap == 150
-        assert config.caption_model_name == "nvidia/nemotron-nano-12b-v2-vl"
+        assert config.caption_model_name == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
         assert (
             config.caption_endpoint_url
             == "https://integrate.api.nvidia.com/v1/chat/completions"
         )
-        assert config.enable_pdf_splitter is True
+        assert config.enable_paged_doc_split is False
+        assert config.object_store_bucket == "nv-ingest"
+
+    @patch.dict(os.environ, {"NVINGEST_OBJECTSTORE_BUCKET": "custom-bucket"})
+    def test_object_store_bucket_from_env(self):
+        """Test NV-Ingest object-store bucket environment override."""
+        config = NvIngestConfig()
+
+        assert config.object_store_bucket == "custom-bucket"
 
     @pytest.mark.parametrize(
         "input_value",
@@ -392,7 +458,7 @@ class TestNvidiaRAGConfig:
         assert isinstance(config.nv_ingest, NvIngestConfig)
         assert isinstance(config.tracing, TracingConfig)
         assert isinstance(config.vlm, VLMConfig)
-        assert isinstance(config.minio, MinioConfig)
+        assert isinstance(config.object_store, ObjectStoreConfig)
         assert isinstance(config.summarizer, SummarizerConfig)
 
         # Test top-level boolean flags
@@ -426,7 +492,8 @@ class TestNvidiaRAGConfig:
             "APP_VECTORSTORE_NAME": "custom_vectorstore",
             "APP_LLM_MODELNAME": "custom/llm-model",
             "ENABLE_RERANKER": "false",
-            "MINIO_ENDPOINT": "custom-minio:9000",
+            "OBJECTSTORE_ENDPOINT": "custom-object-store:9000",
+            "NVINGEST_OBJECTSTORE_ENDPOINT": "internal-object-store:9000",
         }
 
         with patch.dict(os.environ, env_vars):
@@ -435,7 +502,8 @@ class TestNvidiaRAGConfig:
             assert config.vector_store.name == "custom_vectorstore"
             assert config.llm.model_name == "custom/llm-model"
             assert config.ranking.enable_reranker is False
-            assert config.minio.endpoint == "custom-minio:9000"
+            assert config.object_store.endpoint == "custom-object-store:9000"
+            assert config.object_store.nv_ingest_endpoint == "internal-object-store:9000"
 
     def test_from_dict_nested_structure(self):
         """Test loading from dictionary with nested structure."""
@@ -477,10 +545,10 @@ class TestConfigurationIntegration:
             "ENABLE_CITATIONS": "false",
             "ENABLE_RERANKER": "false",
             "ENABLE_VLM_INFERENCE": "true",
-            # Minio config
-            "MINIO_ENDPOINT": "minio.example.com:9000",
-            "MINIO_ACCESSKEY": "test_key",
-            "MINIO_SECRETKEY": "test_secret",
+            # Object-store config
+            "OBJECTSTORE_ENDPOINT": "object-store.example.com:9000",
+            "OBJECTSTORE_ACCESSKEY": "test_key",
+            "OBJECTSTORE_SECRETKEY": "test_secret",
             # Other configs
             "TEMP_DIR": "/custom/temp",
             "VECTOR_DB_TOPK": "50",
@@ -498,9 +566,9 @@ class TestConfigurationIntegration:
             assert config.enable_citations is False
             assert config.ranking.enable_reranker is False
             assert config.enable_vlm_inference is True
-            assert config.minio.endpoint == "minio.example.com:9000"
-            assert config.minio.access_key.get_secret_value() == "test_key"
-            assert config.minio.secret_key.get_secret_value() == "test_secret"
+            assert config.object_store.endpoint == "object-store.example.com:9000"
+            assert config.object_store.access_key.get_secret_value() == "test_key"
+            assert config.object_store.secret_key.get_secret_value() == "test_secret"
             assert config.temp_dir == "/custom/temp"
             assert config.retriever.vdb_top_k == 50
 
@@ -567,8 +635,8 @@ class TestConfigurationIntegration:
         env_vars = {
             "APP_VECTORSTORE_PASSWORD": "my_secret_password",
             "APP_VECTORSTORE_APIKEY": "my_api_key_123",
-            "MINIO_ACCESSKEY": "minio_user",
-            "MINIO_SECRETKEY": "minio_pass_456",
+            "OBJECTSTORE_ACCESSKEY": "object_store_user",
+            "OBJECTSTORE_SECRETKEY": "object_store_pass_456",
         }
 
         with patch.dict(os.environ, env_vars):
@@ -583,18 +651,23 @@ class TestConfigurationIntegration:
             assert isinstance(config.vector_store.api_key, SecretStr)
             assert config.vector_store.api_key.get_secret_value() == "my_api_key_123"
 
-            assert isinstance(config.minio.access_key, SecretStr)
-            assert config.minio.access_key.get_secret_value() == "minio_user"
+            assert isinstance(config.object_store.access_key, SecretStr)
+            assert (
+                config.object_store.access_key.get_secret_value() == "object_store_user"
+            )
 
-            assert isinstance(config.minio.secret_key, SecretStr)
-            assert config.minio.secret_key.get_secret_value() == "minio_pass_456"
+            assert isinstance(config.object_store.secret_key, SecretStr)
+            assert (
+                config.object_store.secret_key.get_secret_value()
+                == "object_store_pass_456"
+            )
 
     @patch.dict(os.environ, {}, clear=True)
     def test_secretstr_with_quoted_environment_variables(self):
         """Test that SecretStr works with quoted environment variables (Docker Compose style)."""
         env_vars = {
             "APP_VECTORSTORE_PASSWORD": '"quoted_password"',  # Double quotes
-            "MINIO_SECRETKEY": "'single_quoted_secret'",  # Single quotes
+            "OBJECTSTORE_SECRETKEY": "'single_quoted_secret'",  # Single quotes
         }
 
         with patch.dict(os.environ, env_vars):
@@ -602,14 +675,17 @@ class TestConfigurationIntegration:
 
             # Verify quotes are stripped and converted to SecretStr
             assert config.vector_store.password.get_secret_value() == "quoted_password"
-            assert config.minio.secret_key.get_secret_value() == "single_quoted_secret"
+            assert (
+                config.object_store.secret_key.get_secret_value()
+                == "single_quoted_secret"
+            )
 
     @patch.dict(os.environ, {}, clear=True)
     def test_secretstr_string_representation_masked(self):
         """Test that SecretStr masks values in string representation."""
         env_vars = {
             "APP_VECTORSTORE_PASSWORD": "secret123",
-            "MINIO_ACCESSKEY": "access456",
+            "OBJECTSTORE_ACCESSKEY": "access456",
         }
 
         with patch.dict(os.environ, env_vars):
@@ -617,7 +693,7 @@ class TestConfigurationIntegration:
 
             # Verify string representation is masked
             password_str = str(config.vector_store.password)
-            access_key_str = str(config.minio.access_key)
+            access_key_str = str(config.object_store.access_key)
 
             assert "secret123" not in password_str
             assert "access456" not in access_key_str
@@ -692,6 +768,20 @@ class TestModelParametersConfigValidation:
         """Test that zero temperature is allowed."""
         config = ModelParametersConfig(temperature=0.0)
         assert config.temperature == 0.0
+
+    @patch.dict(os.environ, {"LLM_TEMPERATURE": "", "LLM_TOP_P": ""}, clear=True)
+    def test_empty_temperature_and_top_p_env_values_use_none(self):
+        """Test that blank deployment env values preserve provider defaults."""
+        config = ModelParametersConfig()
+        assert config.temperature is None
+        assert config.top_p is None
+
+    @patch.dict(os.environ, {"LLM_TEMPERATURE": "0.5", "LLM_TOP_P": "0.9"}, clear=True)
+    def test_temperature_and_top_p_env_values_override_none_defaults(self):
+        """Test that temperature and top_p env values can be explicitly set."""
+        config = ModelParametersConfig()
+        assert config.temperature == 0.5
+        assert config.top_p == 0.9
 
     def test_validate_top_p_out_of_range_raises_error(self):
         """Test that top_p outside [0, 1] raises ValueError."""
@@ -873,7 +963,9 @@ class TestRetrieverConfigValidation:
 
     def test_fetch_neighboring_pages_max_boundary_accepted(self):
         """Test that fetch_neighboring_pages == 10 is valid."""
-        config = RetrieverConfig(fetch_full_page_context=True, fetch_neighboring_pages=10)
+        config = RetrieverConfig(
+            fetch_full_page_context=True, fetch_neighboring_pages=10
+        )
         assert config.fetch_neighboring_pages == 10
 
 
