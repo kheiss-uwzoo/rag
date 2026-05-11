@@ -41,6 +41,7 @@ The following known issues have been resolved in this release:
 
 - Resolved VDB indexing issues during high-concurrency batch parallel ingestion by implementing VDB serialization.
 
+
 ## Release 2.4.0 (2026-02-20)
 
 This release adds new features to the RAG pipeline for supporting agent workflows and enhances generations with VLMs augmenting multimodal input.
